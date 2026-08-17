@@ -1,0 +1,552 @@
+From c5ea062a9280ac8ef91681259d6da0edddc932c0 Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Mon, 17 Aug 2026 09:49:09 +0800
+Subject: [PATCH 2/2] [megatron, perf] test: profile parameter-offload
+ deduplication
+
+Add opt-in host-memory and transition-latency diagnostics plus a log summarizer and focused CPU coverage.
+
+Assisted-by: OpenAI Codex
+---
+ examples/profile/summarize_param_offload.py   | 204 ++++++++++++++++++
+ ...st_param_offload_profile_summary_on_cpu.py |  93 ++++++++
+ verl/utils/megatron_utils.py                  |  49 +++++
+ .../engine/megatron/transformer_impl.py       |  88 ++++++--
+ 4 files changed, 417 insertions(+), 17 deletions(-)
+ create mode 100644 examples/profile/summarize_param_offload.py
+ create mode 100644 tests/utils/test_param_offload_profile_summary_on_cpu.py
+
+diff --git a/examples/profile/summarize_param_offload.py b/examples/profile/summarize_param_offload.py
+new file mode 100644
+index 00000000..ec91bad8
+--- /dev/null
++++ b/examples/profile/summarize_param_offload.py
+@@ -0,0 +1,204 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import argparse
++import json
++import statistics
++from collections import defaultdict
++from pathlib import Path
++
++PREFIX = "VERL_PARAM_OFFLOAD_PROFILE "
++GIB = 1024**3
++
++
++def load_records(path: Path) -> list[dict]:
++    records = []
++    decoder = json.JSONDecoder()
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        start = line.find(PREFIX)
++        if start >= 0:
++            record, _ = decoder.raw_decode(line[start + len(PREFIX) :])
++            records.append(record)
++    if not records:
++        raise ValueError(f"no {PREFIX.strip()} records found in {path}")
++    return records
++
++
++def percentile(values: list[float], q: float) -> float:
++    values = sorted(values)
++    if len(values) == 1:
++        return values[0]
++    position = (len(values) - 1) * q
++    lower = int(position)
++    upper = min(lower + 1, len(values) - 1)
++    weight = position - lower
++    return values[lower] * (1 - weight) + values[upper] * weight
++
++
++def role(record: dict) -> str:
++    if record["forward_only"]:
++        return "ref"
++    return "critic" if record.get("model_type") == "value_model" else "actor"
++
++
++def validate_records(records: list[dict], *, deduplicated: bool) -> None:
++    modes = {record["deduplicated"] for record in records}
++    if modes != {deduplicated}:
++        raise ValueError(f"expected deduplicated={deduplicated}, found {sorted(modes)}")
++
++
++def aggregate_events(records: list[dict]) -> list[dict]:
++    grouped = defaultdict(list)
++    for record in records:
++        key = (role(record), record["action"], record["reason"], record["event_id"])
++        grouped[key].append(record)
++
++    events = []
++    for (model_role, action, reason, event_id), rows in grouped.items():
++        for field in ("world_size", "dense_group_size", "expert_group_size"):
++            values = {row[field] for row in rows}
++            if len(values) != 1:
++                raise ValueError(f"inconsistent {field} for {model_role}/{action}/{reason}/{event_id}: {values}")
++        ranks = {row["rank"] for row in rows}
++        expected_ranks = rows[0]["world_size"]
++        if len(rows) != expected_ranks or ranks != set(range(expected_ranks)):
++            raise ValueError(
++                f"incomplete event {model_role}/{action}/{reason}/{event_id}: "
++                f"found ranks {sorted(ranks)}, expected 0..{expected_ranks - 1} exactly once"
++            )
++        by_host = defaultdict(list)
++        for row in rows:
++            by_host[row["hostname"]].append(row)
++        node_host_bytes = [sum(row["host_total_bytes"] for row in node_rows) for node_rows in by_host.values()]
++        node_rss_bytes = [sum(row["process_rss_bytes"] for row in node_rows) for node_rows in by_host.values()]
++        elapsed = [row["elapsed_s"] for row in rows if row["elapsed_s"] is not None]
++        events.append(
++            {
++                "role": model_role,
++                "action": action,
++                "reason": reason,
++                "event_id": event_id,
++                "dense_group_size": rows[0]["dense_group_size"],
++                "expert_group_size": rows[0]["expert_group_size"],
++                "host_dense_bytes": sum(row["host_dense_bytes"] for row in rows),
++                "host_expert_bytes": sum(row["host_expert_bytes"] for row in rows),
++                "host_bytes": sum(node_host_bytes),
++                "node_max_host_bytes": max(node_host_bytes),
++                "rss_bytes": sum(node_rss_bytes),
++                "node_max_rss_bytes": max(node_rss_bytes),
++                "elapsed_s": max(elapsed) if elapsed else None,
++            }
++        )
++    return events
++
++
++def summarize(records: list[dict], warmup: int) -> dict[tuple[str, str, str], dict]:
++    grouped = defaultdict(list)
++    for event in aggregate_events(records):
++        grouped[(event["role"], event["action"], event["reason"])].append(event)
++
++    summary = {}
++    for key, events in grouped.items():
++        events.sort(key=lambda event: event["event_id"])
++        if len(events) <= warmup:
++            continue
++        measured = events[warmup:]
++        elapsed = [event["elapsed_s"] for event in measured if event["elapsed_s"] is not None]
++        summary[key] = {
++            "samples": len(measured),
++            "dense_group_size": max(event["dense_group_size"] for event in measured),
++            "expert_group_size": max(event["expert_group_size"] for event in measured),
++            "host_dense_gib": statistics.median(event["host_dense_bytes"] for event in measured) / GIB,
++            "host_expert_gib": statistics.median(event["host_expert_bytes"] for event in measured) / GIB,
++            "host_gib": statistics.median(event["host_bytes"] for event in measured) / GIB,
++            "node_max_host_gib": statistics.median(event["node_max_host_bytes"] for event in measured) / GIB,
++            "rss_gib": statistics.median(event["rss_bytes"] for event in measured) / GIB,
++            "node_max_rss_gib": statistics.median(event["node_max_rss_bytes"] for event in measured) / GIB,
++            "latency_p50_s": percentile(elapsed, 0.5) if elapsed else None,
++            "latency_p95_s": percentile(elapsed, 0.95) if elapsed else None,
++        }
++    if not summary:
++        raise ValueError(f"no event group has more than {warmup} warmup samples")
++    return summary
++
++
++def print_summary(name: str, summary: dict) -> None:
++    print(f"\n{name}")
++    print(
++        "role\taction\treason\tn\tdense_group\texpert_group\tdense_host_GiB\texpert_host_GiB\t"
++        "host_GiB\tnode_max_host_GiB\trss_GiB\tnode_max_rss_GiB\tlatency_p50_s\tlatency_p95_s"
++    )
++    for key, row in sorted(summary.items()):
++        latency_p50 = "-" if row["latency_p50_s"] is None else f"{row['latency_p50_s']:.4f}"
++        latency_p95 = "-" if row["latency_p95_s"] is None else f"{row['latency_p95_s']:.4f}"
++        print(
++            f"{key[0]}\t{key[1]}\t{key[2]}\t{row['samples']}\t{row['dense_group_size']}\t"
++            f"{row['expert_group_size']}\t{row['host_dense_gib']:.2f}\t{row['host_expert_gib']:.2f}\t"
++            f"{row['host_gib']:.2f}\t"
++            f"{row['node_max_host_gib']:.2f}\t{row['rss_gib']:.2f}\t{row['node_max_rss_gib']:.2f}\t"
++            f"{latency_p50}\t{latency_p95}"
++        )
++
++
++def print_comparison(baseline: dict, dedup: dict) -> None:
++    if baseline.keys() != dedup.keys():
++        missing_from_dedup = sorted(baseline.keys() - dedup.keys())
++        missing_from_baseline = sorted(dedup.keys() - baseline.keys())
++        raise ValueError(
++            f"profile event groups differ: missing from dedup={missing_from_dedup}, "
++            f"missing from baseline={missing_from_baseline}"
++        )
++    print("\nbaseline -> dedup")
++    print(
++        "role\taction\treason\tdense_saved_GiB\texpert_saved_GiB\thost_saved_GiB\t"
++        "host_saved_pct\tlatency_p50_overhead_pct"
++    )
++    for key in sorted(baseline):
++        before = baseline[key]
++        after = dedup[key]
++        saved = before["host_gib"] - after["host_gib"]
++        saved_pct = 100 * saved / before["host_gib"] if before["host_gib"] else 0.0
++        if before["latency_p50_s"] and after["latency_p50_s"] is not None:
++            overhead = 100 * (after["latency_p50_s"] / before["latency_p50_s"] - 1)
++            overhead_text = f"{overhead:.2f}"
++        else:
++            overhead_text = "-"
++        dense_saved = before["host_dense_gib"] - after["host_dense_gib"]
++        expert_saved = before["host_expert_gib"] - after["host_expert_gib"]
++        print(
++            f"{key[0]}\t{key[1]}\t{key[2]}\t{dense_saved:.2f}\t{expert_saved:.2f}\t"
++            f"{saved:.2f}\t{saved_pct:.2f}\t{overhead_text}"
++        )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Summarize Megatron parameter-offload profile logs.")
++    parser.add_argument("--baseline", type=Path, required=True)
++    parser.add_argument("--dedup", type=Path, required=True)
++    parser.add_argument("--warmup", type=int, default=2)
++    args = parser.parse_args()
++
++    baseline_records = load_records(args.baseline)
++    dedup_records = load_records(args.dedup)
++    validate_records(baseline_records, deduplicated=False)
++    validate_records(dedup_records, deduplicated=True)
++    baseline_summary = summarize(baseline_records, args.warmup)
++    dedup_summary = summarize(dedup_records, args.warmup)
++    print_summary("baseline", baseline_summary)
++    print_summary("dedup", dedup_summary)
++    print_comparison(baseline_summary, dedup_summary)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/utils/test_param_offload_profile_summary_on_cpu.py b/tests/utils/test_param_offload_profile_summary_on_cpu.py
+new file mode 100644
+index 00000000..2cae954a
+--- /dev/null
++++ b/tests/utils/test_param_offload_profile_summary_on_cpu.py
+@@ -0,0 +1,93 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++
++_MODULE_PATH = Path(__file__).parents[2] / "examples" / "profile" / "summarize_param_offload.py"
++_SPEC = importlib.util.spec_from_file_location("summarize_param_offload", _MODULE_PATH)
++assert _SPEC is not None and _SPEC.loader is not None
++summary = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(summary)
++
++
++def _record(rank, event_id, *, dense_bytes, expert_bytes, dense_group_size=2):
++    return {
++        "event_id": event_id,
++        "action": "offload",
++        "reason": "to_train",
++        "deduplicated": False,
++        "forward_only": False,
++        "model_type": "language_model",
++        "rank": rank,
++        "world_size": 2,
++        "hostname": f"node-{rank}",
++        "dense_group_size": dense_group_size,
++        "expert_group_size": 1,
++        "elapsed_s": 0.1 + rank * 0.1,
++        "process_rss_bytes": 100 + rank * 100,
++        "host_dense_bytes": dense_bytes,
++        "host_expert_bytes": expert_bytes,
++        "host_total_bytes": dense_bytes + expert_bytes,
++    }
++
++
++def test_aggregate_events_sums_host_bytes_and_uses_slowest_rank():
++    event = summary.aggregate_events(
++        [
++            _record(0, 0, dense_bytes=10, expert_bytes=1),
++            _record(1, 0, dense_bytes=20, expert_bytes=2),
++        ]
++    )[0]
++
++    assert event["host_dense_bytes"] == 30
++    assert event["host_expert_bytes"] == 3
++    assert event["host_bytes"] == 33
++    assert event["node_max_host_bytes"] == 22
++    assert event["elapsed_s"] == pytest.approx(0.2)
++
++
++def test_aggregate_events_rejects_incomplete_or_inconsistent_rank_records():
++    with pytest.raises(ValueError, match="incomplete event"):
++        summary.aggregate_events([_record(0, 0, dense_bytes=10, expert_bytes=1)])
++
++    with pytest.raises(ValueError, match="inconsistent dense_group_size"):
++        summary.aggregate_events(
++            [
++                _record(0, 0, dense_bytes=10, expert_bytes=1),
++                _record(1, 0, dense_bytes=20, expert_bytes=2, dense_group_size=4),
++            ]
++        )
++
++
++def test_comparison_requires_matching_event_groups():
++    baseline = {("actor", "offload", "to_train"): {}}
++    with pytest.raises(ValueError, match="profile event groups differ"):
++        summary.print_comparison(baseline, {})
++
++
++def test_summarize_skips_one_shot_groups_during_warmup():
++    records = []
++    for event_id, reason in ((0, "to_manual"), (1, "to_train"), (2, "to_train")):
++        for rank in range(2):
++            record = _record(rank, event_id, dense_bytes=10, expert_bytes=1)
++            record["reason"] = reason
++            records.append(record)
++
++    result = summary.summarize(records, warmup=1)
++
++    assert ("actor", "offload", "to_manual") not in result
++    assert result[("actor", "offload", "to_train")]["samples"] == 1
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 4947a29b..017fd61f 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -193,6 +193,55 @@ def _load_replicated_parameter(
+     param._verl_param_offloaded = False
+ 
+ 
++def _parameter_nbytes(param: torch.nn.Parameter) -> int:
++    shape = getattr(param, "_verl_offload_shape", param.shape)
++    numel = 1
++    for dim in shape:
++        numel *= dim
++    return numel * param.element_size()
++
++
++def get_megatron_param_offload_snapshot(models) -> dict[str, int]:
++    """Return logical and resident host parameter bytes for local model shards."""
++    logical = {"dense": 0, "expert": 0}
++    host = {"dense": 0, "expert": 0}
++
++    def add_parameter(param):
++        kind = "dense" if getattr(param, "allreduce", True) else "expert"
++        logical[kind] += _parameter_nbytes(param)
++        if param.device.type == "cpu":
++            host[kind] += param.numel() * param.element_size()
++
++    for model_chunk in models:
++        if isinstance(model_chunk, DDP):
++            for kind, buffers in (
++                ("dense", model_chunk.buffers),
++                ("expert", model_chunk.expert_parallel_buffers),
++            ):
++                for buffer in buffers:
++                    param_data = buffer.param_data
++                    storage_size = getattr(buffer, "param_data_size", param_data.storage().size())
++                    logical[kind] += storage_size * param_data.element_size()
++                    cpu_data = getattr(param_data, "cpu_data", None)
++                    if cpu_data is not None:
++                        host[kind] += cpu_data.numel() * cpu_data.element_size()
++            for param in model_chunk.module.parameters():
++                if not param.requires_grad:
++                    add_parameter(param)
++        else:
++            for param in model_chunk.parameters():
++                add_parameter(param)
++
++    return {
++        "logical_dense_bytes": logical["dense"],
++        "logical_expert_bytes": logical["expert"],
++        "logical_total_bytes": logical["dense"] + logical["expert"],
++        "host_dense_bytes": host["dense"],
++        "host_expert_bytes": host["expert"],
++        "host_total_bytes": host["dense"] + host["expert"],
++    }
++
++
+ def get_model_config(model):
+     return get_attr_wrapped_model(model, "config", allow_none=False)
+ 
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 960a58c9..84a0e2e4 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -68,6 +68,8 @@ from verl.utils.megatron_utils import (
+     check_mtp_config,
+     get_megatron_module_device,
+     get_megatron_mtp_loss,
++    get_megatron_param_offload_snapshot,
++    get_megatron_param_replica_process_groups,
+     load_megatron_model_to_gpu,
+     load_megatron_optimizer,
+     offload_megatron_model_to_cpu,
+@@ -714,23 +716,75 @@ class MegatronEngine(BaseEngine):
+         self.lr_scheduler.step(1)
+         return get_megatron_last_lr(self.optimizer)
+ 
++    def _run_model_transition(self, action: str, reason: str, operation: Callable[[], None]) -> None:
++        profile = os.getenv("VERL_PARAM_OFFLOAD_PROFILE") == "1"
++        if not profile:
++            operation()
++            return
++
++        import json
++        import socket
++        import time
++
++        import psutil
++
++        get_torch_device().synchronize()
++        start = time.perf_counter()
++
++        operation()
++
++        get_torch_device().synchronize()
++        elapsed_s = time.perf_counter() - start
++
++        dense_process_group, expert_process_group = get_megatron_param_replica_process_groups()
++        event_id = getattr(self, "_param_offload_profile_event_id", 0)
++        self._param_offload_profile_event_id = event_id + 1
++        record = {
++            "schema": 1,
++            "event_id": event_id,
++            "action": action,
++            "reason": reason,
++            "deduplicated": self._param_offload_groups is not None,
++            "forward_only": self.engine_config.forward_only,
++            "model_type": self.model_config.model_type,
++            "rank": torch.distributed.get_rank(),
++            "world_size": torch.distributed.get_world_size(),
++            "hostname": socket.gethostname(),
++            "pid": os.getpid(),
++            "dense_group_size": torch.distributed.get_world_size(dense_process_group),
++            "expert_group_size": torch.distributed.get_world_size(expert_process_group),
++            "elapsed_s": elapsed_s,
++            "process_rss_bytes": psutil.Process().memory_info().rss,
++            **get_megatron_param_offload_snapshot(self.module),
++        }
++        logger.warning("VERL_PARAM_OFFLOAD_PROFILE %s", json.dumps(record, sort_keys=True))
++
+     def _load_model(
+         self,
++        reason: str,
+         *,
+         load_grad: bool = True,
+         load_frozen_params: bool = True,
+     ) -> None:
+-        load_megatron_model_to_gpu(
+-            self.module,
+-            load_grad=load_grad,
+-            load_frozen_params=load_frozen_params,
+-            param_offload_groups=self._param_offload_groups,
++        self._run_model_transition(
++            "load",
++            reason,
++            lambda: load_megatron_model_to_gpu(
++                self.module,
++                load_grad=load_grad,
++                load_frozen_params=load_frozen_params,
++                param_offload_groups=self._param_offload_groups,
++            ),
+         )
+ 
+-    def _offload_model(self) -> None:
+-        offload_megatron_model_to_cpu(
+-            self.module,
+-            param_offload_groups=self._param_offload_groups,
++    def _offload_model(self, reason: str) -> None:
++        self._run_model_transition(
++            "offload",
++            reason,
++            lambda: offload_megatron_model_to_cpu(
++                self.module,
++                param_offload_groups=self._param_offload_groups,
++            ),
+         )
+ 
+     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+@@ -750,12 +804,12 @@ class MegatronEngine(BaseEngine):
+         assert device in (device_name, "cpu")
+         if device == device_name:
+             if model:
+-                self._load_model(load_grad=grad)
++                self._load_model(f"to_{self.mode or 'manual'}", load_grad=grad)
+             if optimizer and self.optimizer is not None:
+                 load_megatron_optimizer(self.optimizer)
+         elif device == "cpu":
+             if model:
+-                self._offload_model()
++                self._offload_model(f"to_{self.mode or 'manual'}")
+             if optimizer and self.optimizer is not None:
+                 offload_megatron_optimizer(self.optimizer)
+         else:
+@@ -804,13 +858,13 @@ class MegatronEngine(BaseEngine):
+         """
+         origin_module_device = get_megatron_module_device(self.module)
+         if self._is_offload_param or origin_module_device == "cpu":
+-            self._load_model()
++            self._load_model("checkpoint_save")
+         self.checkpoint_mananager.save_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+         )
+         torch.distributed.barrier()
+         if self._is_offload_param:
+-            self._offload_model()
++            self._offload_model("checkpoint_save")
+ 
+     def load_checkpoint(
+         self, local_path: str, hdfs_path: str | None = None, del_local_after_load: bool = True, **kwargs
+@@ -824,12 +878,12 @@ class MegatronEngine(BaseEngine):
+             del_local_after_load: Whether to delete local copy after loading.
+         """
+         if self._is_offload_param:
+-            self._load_model()
++            self._load_model("checkpoint_load")
+         self.checkpoint_mananager.load_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+         )
+         if self._is_offload_param:
+-            self._offload_model()
++            self._offload_model("checkpoint_load")
+         if self._is_offload_optimizer:
+             offload_megatron_optimizer(self.optimizer)
+ 
+@@ -1042,7 +1096,7 @@ class MegatronEngine(BaseEngine):
+         if non_merge_lora_sync:
+             peft_config = build_peft_config_for_vllm(self.model_config.lora)
+         # when lora adapter only, we only load adapter weights when base sync is done, otherwise load all weights
+-        self._load_model(load_grad=False, load_frozen_params=not adapter_only)
++        self._load_model("weight_export", load_grad=False, load_frozen_params=not adapter_only)
+         if self.vanilla_bridge:
+             per_tensor_param = self.bridge.export_weights(self.module)
+         elif adapter_only:
+@@ -1092,7 +1146,7 @@ class MegatronEngine(BaseEngine):
+         comm-stubbed probe owns all shard geometry). Pure export, no side
+         effects. Params owned by another pipeline stage yield an empty shard
+         (zero-count lockstep rows; see the index builder)."""
+-        self._load_model(load_grad=False)
++        self._load_model("weight_export_shard", load_grad=False)
+         index = self._mcore_export_index()
+ 
+         def _gen():
+-- 
+2.51.0.windows.2
+

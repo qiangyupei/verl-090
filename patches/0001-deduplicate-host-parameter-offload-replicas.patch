@@ -1,0 +1,990 @@
+From 06f7b7dd279c927395a7c84be478d7fd2f9fe3a4 Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Mon, 10 Aug 2026 21:00:42 +0800
+Subject: [PATCH 1/2] [megatron] feat: deduplicate host parameter-offload
+ replicas
+
+Keep one host-side model parameter copy per dense or expert replica group and rebuild the remaining device replicas with a broadcast on reload.
+
+Assisted-by: OpenAI Codex
+---
+ tests/models/test_engine.py                   |  17 +-
+ .../test_param_offload_deduplication.py       | 164 ++++++++
+ .../config/test_engine_config_on_cpu.py       |  15 +
+ .../experimental/separation/engine_workers.py |   7 +-
+ .../_generated_ppo_megatron_trainer.yaml      |   3 +
+ verl/trainer/config/engine/megatron.yaml      |   4 +
+ verl/trainer/config/ref/megatron_ref.yaml     |   1 +
+ verl/utils/megatron_utils.py                  | 358 +++++++++++++-----
+ verl/workers/config/engine.py                 |   7 +
+ .../engine/megatron/transformer_impl.py       |  39 +-
+ 10 files changed, 516 insertions(+), 99 deletions(-)
+ create mode 100644 tests/utils/megatron/test_param_offload_deduplication.py
+
+diff --git a/tests/models/test_engine.py b/tests/models/test_engine.py
+index 16129dad..80e4bdf9 100644
+--- a/tests/models/test_engine.py
++++ b/tests/models/test_engine.py
+@@ -90,9 +90,11 @@ def test_tinker_workers_expose_split_training_primitives():
+         assert name in TinkerActorRolloutRefWorker.__dict__
+ 
+ 
+-def create_training_config(model_type, strategy, device_count, model):
++def create_training_config(model_type, strategy, device_count, model, deduplicate_param_offload=False):
+     if device_count == 1:
+         tp = pp = cp = fsdp_size = 1
++    elif deduplicate_param_offload:
++        tp, pp, cp, fsdp_size = 2, 1, 2, 4
+     else:
+         tp = pp = cp = 2
+         fsdp_size = 4
+@@ -118,6 +120,7 @@ def create_training_config(model_type, strategy, device_count, model):
+             tensor_model_parallel_size=tp,
+             pipeline_model_parallel_size=pp,
+             context_parallel_size=cp,
++            deduplicate_param_offload=deduplicate_param_offload,
+             **kwargs,
+         )
+         optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+@@ -139,15 +142,21 @@ def create_training_config(model_type, strategy, device_count, model):
+     return config
+ 
+ 
+-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "megatron"])
+-def test_actor_engine(strategy):
+-    ray.init()
++@pytest.mark.parametrize(
++    ("strategy", "deduplicate_param_offload"),
++    [("fsdp", False), ("fsdp2", False), ("megatron", False), ("megatron", True)],
++)
++def test_actor_engine(strategy, deduplicate_param_offload):
+     device_count = get_torch_device().device_count()
++    if deduplicate_param_offload and device_count < 8:
++        pytest.skip("parameter-offload deduplication test needs eight ranks to cover DP and CP")
++    ray.init()
+     config = create_training_config(
+         model_type="language_model",
+         strategy=strategy,
+         device_count=device_count,
+         model=get_test_language_model(device_count),
++        deduplicate_param_offload=deduplicate_param_offload,
+     )
+     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(TrainingWorker), config=config)
+     resource_pool = RayResourcePool(process_on_nodes=[device_count])
+diff --git a/tests/utils/megatron/test_param_offload_deduplication.py b/tests/utils/megatron/test_param_offload_deduplication.py
+new file mode 100644
+index 00000000..a7994efe
+--- /dev/null
++++ b/tests/utils/megatron/test_param_offload_deduplication.py
+@@ -0,0 +1,164 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from verl.utils import megatron_utils
++
++
++def _non_owner_group():
++    return megatron_utils.MegatronParamOffloadGroup(
++        process_group=object(),
++        source_rank=0,
++        is_owner=False,
++    )
++
++
++def test_param_offload_group_builder_uses_dense_and_expert_replica_groups(monkeypatch):
++    dense_process_group = object()
++    expert_process_group = object()
++    dense_group_args = []
++    expert_group_args = []
++    monkeypatch.setattr(
++        megatron_utils.mpu,
++        "get_data_parallel_group",
++        lambda with_context_parallel, with_gtp_remat=True: (
++            dense_group_args.append((with_context_parallel, with_gtp_remat)) or dense_process_group
++        ),
++    )
++    monkeypatch.setattr(
++        megatron_utils.mpu,
++        "get_expert_data_parallel_group",
++        lambda with_gtp_remat=True: expert_group_args.append(with_gtp_remat) or expert_process_group,
++    )
++    monkeypatch.setattr(megatron_utils, "_make_param_offload_group", lambda process_group: process_group)
++
++    groups = megatron_utils.build_megatron_param_offload_groups(enabled=True)
++
++    assert groups.dense is dense_process_group
++    assert groups.expert is expert_process_group
++    assert dense_group_args == [(True, False)]
++    assert expert_group_args == [False]
++
++
++def test_param_offload_group_builder_supports_mcore_without_gtp_remat(monkeypatch):
++    dense_process_group = object()
++    expert_process_group = object()
++    monkeypatch.setattr(
++        megatron_utils.mpu,
++        "get_data_parallel_group",
++        lambda with_context_parallel: dense_process_group if with_context_parallel else None,
++    )
++    monkeypatch.setattr(megatron_utils.mpu, "get_expert_data_parallel_group", lambda: expert_process_group)
++    monkeypatch.setattr(megatron_utils, "_make_param_offload_group", lambda process_group: process_group)
++
++    groups = megatron_utils.build_megatron_param_offload_groups(enabled=True)
++
++    assert groups.dense is dense_process_group
++    assert groups.expert is expert_process_group
++
++
++def test_non_owner_ddp_buffer_keeps_no_cpu_copy_and_restores_from_broadcast(monkeypatch):
++    expected = torch.arange(12, dtype=torch.float32)
++    buffer = SimpleNamespace(param_data=expected.clone())
++    group = _non_owner_group()
++
++    megatron_utils._offload_ddp_param_buffer(buffer, group)
++
++    assert buffer.param_data.storage().size() == 0
++    assert buffer.param_data.cpu_data is None
++    monkeypatch.setattr(
++        megatron_utils,
++        "_broadcast_offloaded_parameter",
++        lambda tensor, unused_group: tensor.copy_(expected),
++    )
++    megatron_utils._load_ddp_param_buffer(buffer, group)
++    torch.testing.assert_close(buffer.param_data, expected)
++
++
++def test_deduplicated_buffer_requires_its_group_on_reload():
++    buffer = SimpleNamespace(param_data=torch.ones(4))
++    megatron_utils._offload_ddp_param_buffer(buffer, _non_owner_group())
++
++    with pytest.raises(RuntimeError, match="missing parameter offload group"):
++        megatron_utils._load_ddp_param_buffer(buffer, None)
++
++    assert buffer.param_data.storage().size() == 0
++
++
++def test_expert_parameter_uses_expert_replica_group():
++    dense_group = _non_owner_group()
++    expert_group = _non_owner_group()
++    groups = megatron_utils.MegatronParamOffloadGroups(dense=dense_group, expert=expert_group)
++    dense = torch.nn.Parameter(torch.ones(1))
++    expert = torch.nn.Parameter(torch.ones(1))
++    expert.allreduce = False
++
++    assert megatron_utils._parameter_offload_group(dense, groups) is dense_group
++    assert megatron_utils._parameter_offload_group(expert, groups) is expert_group
++
++
++def test_snapshot_skips_non_owner_buffer_without_cpu_copy(monkeypatch):
++    class FakeDDP:
++        pass
++
++    expected = torch.arange(12, dtype=torch.float32)
++    buffer = SimpleNamespace(param_data=expected.clone())
++    model = FakeDDP()
++    model.buffers = [buffer]
++    model.expert_parallel_buffers = []
++    monkeypatch.setattr(megatron_utils, "DDP", FakeDDP)
++    group = _non_owner_group()
++    groups = megatron_utils.MegatronParamOffloadGroups(dense=group, expert=None)
++
++    megatron_utils._offload_ddp_param_buffer(buffer, group)
++    state = megatron_utils.copy_megatron_model_to_cpu([model], param_offload_groups=groups)
++
++    assert state["model_chunk_0"]["buffer_states"][0][0]["param_data"] is None
++    with pytest.raises(ValueError, match="must match the saved Megatron CPU state"):
++        megatron_utils.restore_megatron_model_from_cpu([model], state)
++    monkeypatch.setattr(
++        megatron_utils,
++        "_broadcast_offloaded_parameter",
++        lambda tensor, unused_group: tensor.copy_(expected),
++    )
++    megatron_utils._load_ddp_param_buffer(buffer, group)
++    buffer.param_data.zero_()
++    megatron_utils.restore_megatron_model_from_cpu([model], state, param_offload_groups=groups)
++    torch.testing.assert_close(buffer.param_data, expected)
++
++
++def test_non_ddp_snapshot_restores_loaded_non_owner_from_owner(monkeypatch):
++    expected = torch.arange(6, dtype=torch.float32)
++    model = torch.nn.Module()
++    model.register_parameter("weight", torch.nn.Parameter(expected.clone()))
++    group = _non_owner_group()
++    groups = megatron_utils.MegatronParamOffloadGroups(dense=group, expert=None)
++
++    megatron_utils._offload_replicated_parameter(model.weight, group)
++    state = megatron_utils.copy_megatron_model_to_cpu([model], param_offload_groups=groups)
++    assert state["model_chunk_0"]["model_state"]["weight"]["data"] is None
++
++    monkeypatch.setattr(
++        megatron_utils,
++        "_broadcast_offloaded_parameter",
++        lambda tensor, unused_group: tensor.copy_(expected),
++    )
++    megatron_utils._load_replicated_parameter(model.weight, group, "cpu")
++    model.weight.zero_()
++    megatron_utils.restore_megatron_model_from_cpu([model], state, param_offload_groups=groups)
++    torch.testing.assert_close(model.weight, expected)
+diff --git a/tests/workers/config/test_engine_config_on_cpu.py b/tests/workers/config/test_engine_config_on_cpu.py
+index 1253f5c9..ef4d1660 100644
+--- a/tests/workers/config/test_engine_config_on_cpu.py
++++ b/tests/workers/config/test_engine_config_on_cpu.py
+@@ -44,6 +44,21 @@ class TestMcoreEngineConfig:
+         config = McoreEngineConfig(**{offload_field: True})
+         assert getattr(config, offload_field) is True
+ 
++    def test_deduplicate_param_offload_requires_param_offload(self):
++        with pytest.raises(ValueError, match="requires param_offload"):
++            McoreEngineConfig(deduplicate_param_offload=True)
++
++        config = McoreEngineConfig(param_offload=True, deduplicate_param_offload=True)
++        assert config.deduplicate_param_offload is True
++
++    def test_deduplicate_param_offload_rejects_megatron_fsdp(self):
++        with pytest.raises(ValueError, match="not supported with use_megatron_fsdp"):
++            McoreEngineConfig(
++                param_offload=True,
++                deduplicate_param_offload=True,
++                use_megatron_fsdp=True,
++            )
++
+ 
+ class TestFSDPEngineConfigCPU:
+     def test_default_values(self):
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 68f3286c..34af9f15 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -15,6 +15,7 @@
+ 
+ import logging
+ import os
++from functools import partial
+ from typing import Callable, Optional
+ 
+ from omegaconf import DictConfig
+@@ -103,7 +104,11 @@ class DetachActorWorker(ActorRolloutRefWorker):
+                 restore_megatron_model_from_cpu,
+             )
+ 
+-            self._strategy_handlers = (copy_megatron_model_to_cpu, restore_megatron_model_from_cpu)
++            param_offload_groups = self.actor.engine._param_offload_groups
++            self._strategy_handlers = (
++                partial(copy_megatron_model_to_cpu, param_offload_groups=param_offload_groups),
++                partial(restore_megatron_model_from_cpu, param_offload_groups=param_offload_groups),
++            )
+         else:
+             raise NotImplementedError(f"Unsupported strategy: {strategy}")
+ 
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index f6212520..24aeb9df 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -45,6 +45,7 @@ actor_rollout_ref:
+     megatron:
+       _target_: verl.workers.config.McoreEngineConfig
+       param_offload: false
++      deduplicate_param_offload: false
+       grad_offload: false
+       optimizer_offload: false
+       tensor_model_parallel_size: 1
+@@ -255,6 +256,7 @@ actor_rollout_ref:
+     megatron:
+       _target_: verl.workers.config.McoreEngineConfig
+       param_offload: ${oc.select:actor_rollout_ref.actor.megatron.param_offload,False}
++      deduplicate_param_offload: ${oc.select:actor_rollout_ref.actor.megatron.deduplicate_param_offload,False}
+       grad_offload: false
+       optimizer_offload: false
+       tensor_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.tensor_model_parallel_size,1}
+@@ -587,6 +589,7 @@ critic:
+   megatron:
+     _target_: verl.workers.config.McoreEngineConfig
+     param_offload: false
++    deduplicate_param_offload: false
+     grad_offload: false
+     optimizer_offload: false
+     tensor_model_parallel_size: 1
+diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
+index f1e2ba40..1bc7e08d 100644
+--- a/verl/trainer/config/engine/megatron.yaml
++++ b/verl/trainer/config/engine/megatron.yaml
+@@ -4,6 +4,10 @@ _target_: verl.workers.config.McoreEngineConfig
+ # Whether to offload model parameters to CPU
+ param_offload: False
+ 
++# Keep one host-side parameter copy per DP x CP replica group and restore the
++# other replicas with a device collective. Requires param_offload=True.
++deduplicate_param_offload: False
++
+ # Whether to offload gradients to CPU
+ grad_offload: False
+ 
+diff --git a/verl/trainer/config/ref/megatron_ref.yaml b/verl/trainer/config/ref/megatron_ref.yaml
+index 823f5d43..28d38c30 100644
+--- a/verl/trainer/config/ref/megatron_ref.yaml
++++ b/verl/trainer/config/ref/megatron_ref.yaml
+@@ -37,4 +37,5 @@ megatron:
+   expert_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.expert_model_parallel_size,1}
+   expert_tensor_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.expert_tensor_parallel_size,null}
+   param_offload: ${oc.select:actor_rollout_ref.actor.megatron.param_offload,False}
++  deduplicate_param_offload: ${oc.select:actor_rollout_ref.actor.megatron.deduplicate_param_offload,False}
+   forward_only: True
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497c..4947a29b 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -49,6 +49,150 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++@dataclass(frozen=True)
++class MegatronParamOffloadGroup:
++    """Ranks that hold identical parameter shards and share one CPU copy."""
++
++    process_group: Any
++    source_rank: int
++    is_owner: bool
++
++
++@dataclass(frozen=True)
++class MegatronParamOffloadGroups:
++    """Replica groups used by dense and expert parameter buffers."""
++
++    dense: MegatronParamOffloadGroup | None
++    expert: MegatronParamOffloadGroup | None
++
++
++def _make_param_offload_group(process_group) -> MegatronParamOffloadGroup | None:
++    if process_group is None or torch.distributed.get_world_size(process_group) <= 1:
++        return None
++    source_rank = torch.distributed.get_global_rank(process_group, 0)
++    return MegatronParamOffloadGroup(
++        process_group=process_group,
++        source_rank=source_rank,
++        is_owner=torch.distributed.get_rank(process_group) == 0,
++    )
++
++
++def get_megatron_param_replica_process_groups():
++    """Return dense and expert groups whose ranks hold identical parameters."""
++    dense_kwargs = {"with_context_parallel": True}
++    if "with_gtp_remat" in inspect.signature(mpu.get_data_parallel_group).parameters:
++        dense_kwargs["with_gtp_remat"] = False
++
++    expert_kwargs = {}
++    if "with_gtp_remat" in inspect.signature(mpu.get_expert_data_parallel_group).parameters:
++        expert_kwargs["with_gtp_remat"] = False
++
++    return (
++        mpu.get_data_parallel_group(**dense_kwargs),
++        mpu.get_expert_data_parallel_group(**expert_kwargs),
++    )
++
++
++def build_megatron_param_offload_groups(enabled: bool) -> MegatronParamOffloadGroups | None:
++    """Build groups of ranks that own identical dense or expert shards."""
++    if not enabled:
++        return None
++    dense_process_group, expert_process_group = get_megatron_param_replica_process_groups()
++    return MegatronParamOffloadGroups(
++        dense=_make_param_offload_group(dense_process_group),
++        expert=_make_param_offload_group(expert_process_group),
++    )
++
++
++def _parameter_offload_group(
++    param: torch.nn.Parameter,
++    groups: MegatronParamOffloadGroups,
++) -> MegatronParamOffloadGroup | None:
++    return groups.dense if getattr(param, "allreduce", True) else groups.expert
++
++
++def _broadcast_offloaded_parameter(tensor: torch.Tensor, group: MegatronParamOffloadGroup) -> None:
++    torch.distributed.broadcast(tensor, src=group.source_rank, group=group.process_group)
++
++
++def _offload_ddp_param_buffer(buffer, group: MegatronParamOffloadGroup | None) -> None:
++    param_data = buffer.param_data
++    if param_data.storage().size() == 0:
++        return
++    if group is None or group.is_owner:
++        existing = getattr(param_data, "cpu_data", None)
++        if existing is None:
++            param_data.cpu_data = torch.empty(param_data.size(), dtype=param_data.dtype, device="cpu", pin_memory=True)
++            buffer.param_data_size = param_data.storage().size()
++        else:
++            assert existing.shape == param_data.shape
++            assert existing.dtype == param_data.dtype
++        param_data.cpu_data.copy_(param_data, non_blocking=False)
++        assert buffer.param_data_size == param_data.cpu_data.storage().size()
++    else:
++        buffer.param_data_size = param_data.storage().size()
++        param_data.cpu_data = None
++    param_data.storage().resize_(0)
++
++
++def _load_ddp_param_buffer(buffer, group: MegatronParamOffloadGroup | None) -> None:
++    param_data = buffer.param_data
++    if param_data.storage().size() != 0:
++        return
++    if group is None and getattr(param_data, "cpu_data", None) is None:
++        raise RuntimeError("missing parameter offload group for a deduplicated buffer")
++    param_data.storage().resize_(buffer.param_data_size)
++    if group is None or group.is_owner:
++        param_data.copy_(param_data.cpu_data, non_blocking=True)
++    if group is not None:
++        _broadcast_offloaded_parameter(param_data, group)
++
++
++def _offload_replicated_parameter(param: torch.nn.Parameter, group: MegatronParamOffloadGroup) -> None:
++    if getattr(param, "_verl_param_offloaded", False):
++        return
++    param._verl_offload_shape = tuple(param.shape)
++    param._verl_offload_stride = tuple(param.stride())
++    param._verl_param_offloaded = True
++    old_data = param.data
++    if group.is_owner:
++        if old_data.device.type != "cpu":
++            param.data = old_data.to("cpu")
++            if _can_safely_resize_storage(old_data):
++                old_data.storage().resize_(0)
++    else:
++        param.data = torch.empty(0, dtype=param.dtype, device="cpu")
++        if _can_safely_resize_storage(old_data):
++            old_data.storage().resize_(0)
++    if param.grad is not None and param.grad.device.type != "cpu":
++        old_grad = param.grad
++        param.grad = old_grad.to("cpu")
++        if _can_safely_resize_storage(old_grad):
++            old_grad.storage().resize_(0)
++
++
++def _load_replicated_parameter(
++    param: torch.nn.Parameter,
++    group: MegatronParamOffloadGroup,
++    device,
++) -> None:
++    if not getattr(param, "_verl_param_offloaded", False):
++        return
++    if group.is_owner:
++        param.data = param.data.to(device, non_blocking=True)
++    else:
++        param.data = torch.empty_strided(
++            param._verl_offload_shape,
++            param._verl_offload_stride,
++            dtype=param.dtype,
++            device=device,
++        )
++    _broadcast_offloaded_parameter(param.data, group)
++    if param.grad is not None:
++        param.grad = param.grad.to(device, non_blocking=True)
++    param._verl_param_offloaded = False
++
++
+ def get_model_config(model):
+     return get_attr_wrapped_model(model, "config", allow_none=False)
+ 
+@@ -660,62 +804,32 @@ def _clear_te_fp8_weight_workspaces(model_chunk):
+ 
+ 
+ @torch.no_grad()
+-def offload_megatron_model_to_cpu(models):
++def offload_megatron_model_to_cpu(
++    models,
++    param_offload_groups: MegatronParamOffloadGroups | None = None,
++):
+     """
+     In megatron, the model and optimizer storage are:
+     - bf16 parameter data chunked in model parallel group
+     - fp32 grad chunked in model parallel group
+     - fp32 main_parameter chunked in model and dp group
+     - fp32 optimizer state chunked in model and dp group
++
++    ``param_offload_groups`` enables one host parameter copy per replica group.
+     """
++    if param_offload_groups is not None and (
++        param_offload_groups.dense is not None or param_offload_groups.expert is not None
++    ):
++        get_torch_device().synchronize()
+     for model_chunk in models:
+         if isinstance(model_chunk, DDP):
+-            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
+-            for buffers in model_chunk_all_buffers:
++            buffer_groups = (
++                (model_chunk.buffers, param_offload_groups.dense if param_offload_groups else None),
++                (model_chunk.expert_parallel_buffers, param_offload_groups.expert if param_offload_groups else None),
++            )
++            for buffers, offload_group in buffer_groups:
+                 for buffer in buffers:
+-                    # offload parameters
+-                    if buffer.param_data.storage().size() > 0:
+-                        # Reuse a single pinned cpu_data buffer per DDP buffer.
+-                        # The previous implementation reallocated cpu_data via
+-                        # `.cpu().pin_memory()` on every offload. Python evaluates
+-                        # the RHS before the assignment, so the new pinned block is
+-                        # allocated while the old cpu_data is still referenced --
+-                        # peak host memory at the moment of allocation is 2x
+-                        # param_data size. On large Megatron models this transient
+-                        # peak exceeds the cgroup limit and OOMKills the pod even
+-                        # though steady-state usage would be 1x. Reallocating here
+-                        # would re-trigger the same 2x peak, so we allocate at most
+-                        # once per buffer and assert shape/dtype invariance on
+-                        # subsequent calls -- a mismatch means a caller rebuilt
+-                        # param_data under us, which is a bug we want surfaced
+-                        # rather than silently worked around.
+-                        existing = getattr(buffer.param_data, "cpu_data", None)
+-                        if existing is None:
+-                            buffer.param_data.cpu_data = torch.empty(
+-                                buffer.param_data.size(),
+-                                dtype=buffer.param_data.dtype,
+-                                device="cpu",
+-                                pin_memory=True,
+-                            )
+-                            buffer.param_data_size = buffer.param_data.storage().size()
+-                        else:
+-                            assert existing.shape == buffer.param_data.shape, (
+-                                f"cpu_data shape {tuple(existing.shape)} != "
+-                                f"param_data shape {tuple(buffer.param_data.shape)}; "
+-                                "reallocating would reintroduce the 2x peak."
+-                            )
+-                            assert existing.dtype == buffer.param_data.dtype, (
+-                                f"cpu_data dtype {existing.dtype} != "
+-                                f"param_data dtype {buffer.param_data.dtype}; "
+-                                "reallocating would reintroduce the 2x peak."
+-                            )
+-                        # Synchronous D2H copy into the preexisting pinned
+-                        # buffer; must complete before resize_(0) frees the
+-                        # GPU storage.
+-                        buffer.param_data.cpu_data.copy_(buffer.param_data.data, non_blocking=False)
+-                        buffer.param_data.storage().resize_(0)
+-
+-                    assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
++                    _offload_ddp_param_buffer(buffer, offload_group)
+ 
+                     if buffer.grad_data.storage().size() > 0:
+                         # if the grad_data size is already zero, we assume that it is already offloaded
+@@ -724,20 +838,30 @@ def offload_megatron_model_to_cpu(models):
+             # Offload frozen parameters not in DDP buffers (e.g. base model in LoRA/PEFT)
+             # DDP buffers only contain requires_grad=True params, so frozen params must be offloaded separately.
+             for param in model_chunk.module.parameters():
+-                if not param.requires_grad and param.device.type != "cpu":
+-                    param.data = param.data.to("cpu", non_blocking=True)
++                if not param.requires_grad:
++                    offload_group = (
++                        _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                    )
++                    if offload_group is not None:
++                        _offload_replicated_parameter(param, offload_group)
++                    elif param.device.type != "cpu":
++                        param.data = param.data.to("cpu", non_blocking=True)
+         else:
+             # we need this for ref module
+             for _, param in model_chunk.named_parameters():
+-                old_data = param.data
+-                param.data = param.data.to("cpu")
+-                if _can_safely_resize_storage(old_data):
+-                    old_data.storage().resize_(0)
+-                if param.grad is not None:
+-                    old_grad = param.grad
+-                    param.grad = param.grad.to("cpu")
+-                    if _can_safely_resize_storage(old_grad):
+-                        old_grad.storage().resize_(0)
++                offload_group = _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                if offload_group is None:
++                    old_data = param.data
++                    param.data = param.data.to("cpu")
++                    if _can_safely_resize_storage(old_data):
++                        old_data.storage().resize_(0)
++                    if param.grad is not None:
++                        old_grad = param.grad
++                        param.grad = old_grad.to("cpu")
++                        if _can_safely_resize_storage(old_grad):
++                            old_grad.storage().resize_(0)
++                else:
++                    _offload_replicated_parameter(param, offload_group)
+ 
+         # Drop Transformer-Engine FP8 weight-workspace caches, which hold quantized
+         # copies of the weights on GPU and are not covered by the parameter offload above.
+@@ -750,18 +874,27 @@ def offload_megatron_model_to_cpu(models):
+ 
+ 
+ @torch.no_grad()
+-def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
++def load_megatron_model_to_gpu(
++    models,
++    load_grad=True,
++    load_frozen_params=True,
++    param_offload_groups: MegatronParamOffloadGroups | None = None,
++):
+     """
+     Load megatron model to GPU.
+     Args:
+         models: The model to load.
+         load_grad: Whether to load gradients.
+         load_frozen_params: Whether to load frozen parameters.
++        param_offload_groups: Optional replica groups used to rebuild deduplicated parameters.
+     """
+     for model_chunk in models:
+         if isinstance(model_chunk, DDP):
+-            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
+-            for buffers in model_chunk_all_buffers:
++            buffer_groups = (
++                (model_chunk.buffers, param_offload_groups.dense if param_offload_groups else None),
++                (model_chunk.expert_parallel_buffers, param_offload_groups.expert if param_offload_groups else None),
++            )
++            for buffers, offload_group in buffer_groups:
+                 for buffer in buffers:
+                     # sometimes, we don't want to load grad for pure inference
+                     if load_grad and hasattr(buffer, "grad_data_size"):
+@@ -775,24 +908,35 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
+                             # zero in-place with current storage.
+                             buffer.grad_data.zero_()
+ 
+-                    if buffer.param_data.storage().size() == 0:
+-                        buffer.param_data.storage().resize_(buffer.param_data_size)
+-                        # copy data from cpu to cuda
+-                        buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
++                    _load_ddp_param_buffer(buffer, offload_group)
+ 
+             # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
+             if load_frozen_params:
+                 device_id = get_device_id()
+                 for param in model_chunk.module.parameters():
+-                    if not param.requires_grad and param.device.type == "cpu":
+-                        param.data = param.data.to(device_id, non_blocking=True)
++                    if not param.requires_grad:
++                        offload_group = (
++                            _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                        )
++                        if offload_group is not None:
++                            _load_replicated_parameter(param, offload_group, device_id)
++                        elif getattr(param, "_verl_param_offloaded", False):
++                            raise RuntimeError("missing parameter offload group for a deduplicated parameter")
++                        elif param.device.type == "cpu":
++                            param.data = param.data.to(device_id, non_blocking=True)
+         else:
+             # we need this for ref module
+             device_id = get_device_id()
+             for _, param in model_chunk.named_parameters():
+-                param.data = param.data.to(device_id, non_blocking=True)
+-                if param.grad is not None:
+-                    param.grad = param.grad.to(device_id, non_blocking=True)
++                offload_group = _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                if offload_group is None:
++                    if getattr(param, "_verl_param_offloaded", False):
++                        raise RuntimeError("missing parameter offload group for a deduplicated parameter")
++                    param.data = param.data.to(device_id, non_blocking=True)
++                    if param.grad is not None:
++                        param.grad = param.grad.to(device_id, non_blocking=True)
++                else:
++                    _load_replicated_parameter(param, offload_group, device_id)
+     gc.collect()
+     get_torch_device().empty_cache()
+ 
+@@ -1861,7 +2005,10 @@ def patch_engine_mtp(module, model_config):
+ 
+ 
+ @torch.no_grad()
+-def copy_megatron_model_to_cpu(models):
++def copy_megatron_model_to_cpu(
++    models,
++    param_offload_groups: MegatronParamOffloadGroups | None = None,
++):
+     """
+     Copy Megatron model parameters to CPU memory (non-destructive copy).
+     Unlike offload_megatron_model_to_cpu which moves data, this function creates
+@@ -1869,28 +2016,37 @@ def copy_megatron_model_to_cpu(models):
+ 
+     Args:
+         models: List of model chunks (DDP-wrapped or unwrapped)
++        param_offload_groups: Optional replica groups used to deduplicate the snapshot.
+ 
+     Returns:
+         dict: CPU state containing copied parameters and buffers
+     """
+-    cpu_state = {}
++    cpu_state = {"deduplicated": param_offload_groups is not None}
+ 
+     for model_idx, model_chunk in enumerate(models):
+         if isinstance(model_chunk, DDP):
+             # Handle DDP-wrapped models
+-            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
++            buffer_groups = (
++                (model_chunk.buffers, param_offload_groups.dense if param_offload_groups else None),
++                (model_chunk.expert_parallel_buffers, param_offload_groups.expert if param_offload_groups else None),
++            )
+             buffer_states = []
+ 
+-            for buffers in model_chunk_all_buffers:
++            for buffers, offload_group in buffer_groups:
+                 buffer_list = []
+                 for buffer in buffers:
+                     buffer_state = {}
+ 
+                     # Copy parameter data to CPU
+                     if buffer.param_data.storage().size() > 0:
+-                        buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
++                        buffer_state["param_data"] = (
++                            buffer.param_data.data.cpu().clone().pin_memory()
++                            if offload_group is None or offload_group.is_owner
++                            else None
++                        )
+                     else:
+-                        buffer_state["param_data"] = buffer.param_data.cpu_data.clone().pin_memory()
++                        cpu_data = getattr(buffer.param_data, "cpu_data", None)
++                        buffer_state["param_data"] = None if cpu_data is None else cpu_data.clone().pin_memory()
+ 
+                     buffer_list.append(buffer_state)
+                 buffer_states.append(buffer_list)
+@@ -1900,7 +2056,14 @@ def copy_megatron_model_to_cpu(models):
+             # Handle non-DDP models (ref module)
+             model_state = {}
+             for name, param in model_chunk.named_parameters():
+-                param_state = {"data": param.data.cpu().clone().pin_memory()}
++                offload_group = _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                param_state = {
++                    "data": (
++                        param.data.cpu().clone().pin_memory()
++                        if offload_group is None or offload_group.is_owner
++                        else None
++                    )
++                }
+                 model_state[name] = param_state
+ 
+             cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
+@@ -1909,14 +2072,22 @@ def copy_megatron_model_to_cpu(models):
+ 
+ 
+ @torch.no_grad()
+-def restore_megatron_model_from_cpu(models, cpu_state):
++def restore_megatron_model_from_cpu(
++    models,
++    cpu_state,
++    param_offload_groups: MegatronParamOffloadGroups | None = None,
++):
+     """
+     Restore Megatron model parameters from CPU memory back to GPU.
+ 
+     Args:
+         models: List of model chunks to restore to
+         cpu_state: CPU state dict returned from copy_megatron_model_to_cpu
++        param_offload_groups: Optional replica groups used to broadcast restored parameters.
+     """
++    if cpu_state.get("deduplicated", False) != (param_offload_groups is not None):
++        raise ValueError("param_offload_groups must match the saved Megatron CPU state")
++
+     for model_idx, model_chunk in enumerate(models):
+         chunk_key = f"model_chunk_{model_idx}"
+         if chunk_key not in cpu_state:
+@@ -1926,22 +2097,37 @@ def restore_megatron_model_from_cpu(models, cpu_state):
+ 
+         if chunk_state["is_ddp"] and isinstance(model_chunk, DDP):
+             # Restore DDP buffers
+-            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
++            buffer_groups = (
++                (model_chunk.buffers, param_offload_groups.dense if param_offload_groups else None),
++                (model_chunk.expert_parallel_buffers, param_offload_groups.expert if param_offload_groups else None),
++            )
+             buffer_states = chunk_state["buffer_states"]
+ 
+-            for buffers, buffer_list in zip(model_chunk_all_buffers, buffer_states, strict=False):
++            for (buffers, offload_group), buffer_list in zip(buffer_groups, buffer_states, strict=False):
+                 for buffer, buffer_state in zip(buffers, buffer_list, strict=False):
+-                    # Restore parameter data
+-                    if "param_data" in buffer_state:
+-                        if buffer.param_data.storage().size() > 0:
++                    saved_param_data = buffer_state.get("param_data")
++                    if buffer.param_data.storage().size() > 0:
++                        if saved_param_data is not None:
+                             buffer.param_data.data.copy_(buffer_state["param_data"].to(buffer.param_data.device))
+-                        else:
+-                            buffer.param_data.cpu_data.copy_(buffer_state["param_data"])
++                        if offload_group is not None:
++                            _broadcast_offloaded_parameter(buffer.param_data, offload_group)
++                    elif saved_param_data is not None:
++                        buffer.param_data.cpu_data.copy_(buffer_state["param_data"])
+ 
+         elif not chunk_state["is_ddp"] and not isinstance(model_chunk, DDP):
+             # Restore non-DDP models
+             model_state = chunk_state["model_state"]
+             for name, param in model_chunk.named_parameters():
+                 if name in model_state:
+-                    param_state = model_state[name]
+-                    param.data.copy_(param_state["data"].to(param.device))
++                    saved_param_data = model_state[name]["data"]
++                    offload_group = (
++                        _parameter_offload_group(param, param_offload_groups) if param_offload_groups else None
++                    )
++                    if getattr(param, "_verl_param_offloaded", False):
++                        if saved_param_data is not None:
++                            param.data.copy_(saved_param_data)
++                    else:
++                        if saved_param_data is not None:
++                            param.data.copy_(saved_param_data.to(param.device))
++                        if offload_group is not None:
++                            _broadcast_offloaded_parameter(param.data, offload_group)
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 5df864ab..5f965427 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -156,6 +156,8 @@ class McoreEngineConfig(EngineConfig):
+         param_offload (bool): Whether to offload parameters to CPU.
+         grad_offload (bool): Whether to offload gradients to CPU.
+         optimizer_offload (bool): Whether to offload optimizer states to CPU.
++        deduplicate_param_offload (bool): Keep one host copy for each replicated
++            dense or expert parameter shard and restore replicas with a broadcast.
+         tensor_model_parallel_size (int): Tensor model parallel size.
+         expert_model_parallel_size (int): Expert model parallel size for MoE models.
+         expert_tensor_parallel_size (Optional[int]): Expert tensor parallel size for MoE models.
+@@ -185,6 +187,7 @@ class McoreEngineConfig(EngineConfig):
+     # sequence_parallel is not listed as a frozen field for auto-correction purpose
+     _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel"}
+     # mcore parallelism
++    deduplicate_param_offload: bool = False
+     tensor_model_parallel_size: int = 1
+     expert_model_parallel_size: int = 1
+     expert_tensor_parallel_size: Optional[int] = None
+@@ -219,6 +222,10 @@ class McoreEngineConfig(EngineConfig):
+         """config validation logics go here"""
+         assert self.strategy == "megatron"
+         assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
++        if self.deduplicate_param_offload and not self.param_offload:
++            raise ValueError("deduplicate_param_offload requires param_offload=True")
++        if self.deduplicate_param_offload and self.use_megatron_fsdp:
++            raise ValueError("deduplicate_param_offload is not supported with use_megatron_fsdp=True")
+         if self.vanilla_mbridge:
+             warnings.warn(
+                 "The legacy mbridge backend selected by `vanilla_mbridge=True` is deprecated and will be removed "
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index e8a6c560..960a58c9 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -64,6 +64,7 @@ from verl.utils.megatron.tensor_parallel import (
+ )
+ from verl.utils.megatron_peft_utils import build_peft_config_for_vllm
+ from verl.utils.megatron_utils import (
++    build_megatron_param_offload_groups,
+     check_mtp_config,
+     get_megatron_module_device,
+     get_megatron_mtp_loss,
+@@ -197,6 +198,9 @@ class MegatronEngine(BaseEngine):
+         self._is_offload_param = self.engine_config.param_offload
+         self._is_offload_grad = self.engine_config.grad_offload
+         self._is_offload_optimizer = self.engine_config.optimizer_offload
++        self._param_offload_groups = build_megatron_param_offload_groups(
++            self._is_offload_param and self.engine_config.deduplicate_param_offload
++        )
+ 
+         self.mode = None
+ 
+@@ -710,6 +714,25 @@ class MegatronEngine(BaseEngine):
+         self.lr_scheduler.step(1)
+         return get_megatron_last_lr(self.optimizer)
+ 
++    def _load_model(
++        self,
++        *,
++        load_grad: bool = True,
++        load_frozen_params: bool = True,
++    ) -> None:
++        load_megatron_model_to_gpu(
++            self.module,
++            load_grad=load_grad,
++            load_frozen_params=load_frozen_params,
++            param_offload_groups=self._param_offload_groups,
++        )
++
++    def _offload_model(self) -> None:
++        offload_megatron_model_to_cpu(
++            self.module,
++            param_offload_groups=self._param_offload_groups,
++        )
++
+     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+         """
+         Move model parameters, optimizer states, or both to the specified device.
+@@ -727,12 +750,12 @@ class MegatronEngine(BaseEngine):
+         assert device in (device_name, "cpu")
+         if device == device_name:
+             if model:
+-                load_megatron_model_to_gpu(self.module, load_grad=grad)
++                self._load_model(load_grad=grad)
+             if optimizer and self.optimizer is not None:
+                 load_megatron_optimizer(self.optimizer)
+         elif device == "cpu":
+             if model:
+-                offload_megatron_model_to_cpu(self.module)
++                self._offload_model()
+             if optimizer and self.optimizer is not None:
+                 offload_megatron_optimizer(self.optimizer)
+         else:
+@@ -781,13 +804,13 @@ class MegatronEngine(BaseEngine):
+         """
+         origin_module_device = get_megatron_module_device(self.module)
+         if self._is_offload_param or origin_module_device == "cpu":
+-            load_megatron_model_to_gpu(self.module, load_grad=True)
++            self._load_model()
+         self.checkpoint_mananager.save_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+         )
+         torch.distributed.barrier()
+         if self._is_offload_param:
+-            offload_megatron_model_to_cpu(self.module)
++            self._offload_model()
+ 
+     def load_checkpoint(
+         self, local_path: str, hdfs_path: str | None = None, del_local_after_load: bool = True, **kwargs
+@@ -801,12 +824,12 @@ class MegatronEngine(BaseEngine):
+             del_local_after_load: Whether to delete local copy after loading.
+         """
+         if self._is_offload_param:
+-            load_megatron_model_to_gpu(self.module)
++            self._load_model()
+         self.checkpoint_mananager.load_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+         )
+         if self._is_offload_param:
+-            offload_megatron_model_to_cpu(self.module)
++            self._offload_model()
+         if self._is_offload_optimizer:
+             offload_megatron_optimizer(self.optimizer)
+ 
+@@ -1019,7 +1042,7 @@ class MegatronEngine(BaseEngine):
+         if non_merge_lora_sync:
+             peft_config = build_peft_config_for_vllm(self.model_config.lora)
+         # when lora adapter only, we only load adapter weights when base sync is done, otherwise load all weights
+-        load_megatron_model_to_gpu(self.module, load_grad=False, load_frozen_params=not adapter_only)
++        self._load_model(load_grad=False, load_frozen_params=not adapter_only)
+         if self.vanilla_bridge:
+             per_tensor_param = self.bridge.export_weights(self.module)
+         elif adapter_only:
+@@ -1069,7 +1092,7 @@ class MegatronEngine(BaseEngine):
+         comm-stubbed probe owns all shard geometry). Pure export, no side
+         effects. Params owned by another pipeline stage yield an empty shard
+         (zero-count lockstep rows; see the index builder)."""
+-        load_megatron_model_to_gpu(self.module, load_grad=False)
++        self._load_model(load_grad=False)
+         index = self._mcore_export_index()
+ 
+         def _gen():
+
+base-commit: 483b8a009ba3a97563edee3a19887e4862b8094a
+-- 
+2.51.0.windows.2
+
