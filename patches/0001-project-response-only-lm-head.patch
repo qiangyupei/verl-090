@@ -1,0 +1,815 @@
+From c0cd2ad76263151cfc5ac626edc971920bd016a1 Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Wed, 19 Aug 2026 12:03:55 +0800
+Subject: [PATCH 1/2] [megatron] feat: project LM head only for response tokens
+
+Select next-token-aligned loss-mask rows before the vocabulary projection, then restore scalar token outputs to the regular layout. Preserve tensor/sequence/context-parallel semantics and fail closed for unsupported fused, MTP, and top-k paths.
+
+Assisted-by: OpenAI Codex
+---
+ docs/perf/perf_tuning.rst                     |  23 ++-
+ .../test_response_only_lm_head_on_cpu.py      | 184 ++++++++++++++++++
+ .../config/test_engine_config_on_cpu.py       |   1 +
+ .../test_megatron_distillation_only_on_cpu.py |  55 ++++++
+ verl/models/mcore/model_forward.py            |  86 ++++++--
+ verl/models/mcore/response_only_lm_head.py    | 149 ++++++++++++++
+ .../_generated_ppo_megatron_trainer.yaml      |   3 +
+ verl/trainer/config/engine/megatron.yaml      |   4 +
+ verl/workers/config/engine.py                 |   3 +
+ .../engine/megatron/transformer_impl.py       |  30 ++-
+ 10 files changed, 520 insertions(+), 18 deletions(-)
+ create mode 100644 tests/models/mcore/test_response_only_lm_head_on_cpu.py
+ create mode 100644 verl/models/mcore/response_only_lm_head.py
+
+diff --git a/docs/perf/perf_tuning.rst b/docs/perf/perf_tuning.rst
+index ed6c407c..374d901d 100644
+--- a/docs/perf/perf_tuning.rst
++++ b/docs/perf/perf_tuning.rst
+@@ -1,7 +1,7 @@
+ Performance Tuning Guide
+ ==============================
+ 
+-Last updated: 07/17/2025.
++Last updated: 08/19/2026.
+ 
+ Author: `Guangming Sheng <https://github.com/PeterSH6>`_, `Jiali Zheng <https://github.com/CurryRice233>`_
+ 
+@@ -246,3 +246,24 @@ This processes the tensor in chunks of shape ``[chunk_size, voc]`` (e.g., 2048)
+ Additionally, during training, standard gradient checkpointing (``enable_gradient_checkpointing=True``) does not apply to entropy calculations. To reduce memory peaks in this context, set:
+ ``actor_rollout_ref.actor.entropy_checkpointing = True``
+ This enables entropy recomputation specifically for the entropy calculation, lowering memory usage during training.
++
++Project only loss-bearing rows in the Megatron LM head
++-------------------------------------------------------
++
++Agent trajectories can contain long prompts and environment or tool-output
++spans that do not contribute to the policy loss. The unfused Megatron path can
++skip the vocabulary projection for those rows by enabling::
++
++    actor_rollout_ref.actor.megatron.response_only_lm_head = True
++    actor_rollout_ref.ref.megatron.response_only_lm_head = True
++
++The optimization applies the causal shift to ``loss_mask``, selects the
++corresponding hidden-state rows before the LM head, and restores token-level
++log-probability and entropy outputs to their original layout with zeros at
++unselected positions. It supports THD and BSHD inputs together with tensor,
++sequence, context, and pipeline parallelism.
++
++The expected LM-head logits reduction is proportional to the active-row ratio
++``loss_mask.sum() / input_tokens``. This option uses the unfused forward path
++and currently does not support MTP training or top-k distillation. It is most
++useful when the active-row ratio is low and the vocabulary is large.
+diff --git a/tests/models/mcore/test_response_only_lm_head_on_cpu.py b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
+new file mode 100644
+index 00000000..a5cc3ec3
+--- /dev/null
++++ b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
+@@ -0,0 +1,184 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from unittest.mock import patch
++
++import pytest
++import torch
++
++from verl.models.mcore.model_forward import _build_full_loss_mask_nested
++from verl.models.mcore.response_only_lm_head import (
++    response_only_output_projection,
++    restore_response_only_outputs,
++    select_response_only_inputs,
++)
++from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
++
++
++class _FakeOutputLayer(torch.nn.Module):
++    def __init__(self, *, sequence_parallel=True, supports_disable_grad_reduce=True):
++        super().__init__()
++        self.sequence_parallel = sequence_parallel
++        if supports_disable_grad_reduce:
++            self.disable_grad_reduce = False
++        self.tp_group = object()
++
++    def forward(self, input_):
++        return input_, None
++
++
++class _FakeLinearOutputLayer(torch.nn.Module):
++    def __init__(self, hidden_size, vocab_size):
++        super().__init__()
++        self.sequence_parallel = False
++        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size))
++
++    def forward(self, input_):
++        return torch.nn.functional.linear(input_, self.weight), None
++
++
++class _Model(torch.nn.Module):
++    def __init__(self, output_layer):
++        super().__init__()
++        self.output_layer = output_layer
++
++    def forward(self, hidden_states):
++        logits, _ = self.output_layer(hidden_states)
++        return logits.transpose(0, 1).contiguous()
++
++
++@pytest.mark.parametrize("data_format", ["thd", "bshd"])
++def test_response_mask_is_next_token_aligned_with_internal_tool_spans(data_format):
++    padded_response_mask = torch.tensor(
++        [
++            [1, 1, 0, 1, 0],
++            [1, 0, 1, 1, 0],
++        ],
++        dtype=torch.bool,
++    )
++    response_attention_mask = torch.tensor(
++        [
++            [1, 1, 1, 1, 1],
++            [1, 1, 1, 1, 0],
++        ],
++        dtype=torch.bool,
++    )
++    if data_format == "thd":
++        response_mask = torch.nested.as_nested_tensor(
++            [padded_response_mask[0], padded_response_mask[1, :4]], layout=torch.jagged
++        )
++        response_attention_mask = None
++        preprocess = preprocess_thd_engine
++    else:
++        response_mask = padded_response_mask
++        preprocess = preprocess_bshd_engine
++    full_mask = _build_full_loss_mask_nested(response_mask, [8, 8], response_attention_mask)
++
++    with (
++        patch("verl.models.mcore.util.mpu.get_context_parallel_world_size", return_value=1),
++        patch("verl.models.mcore.util.mpu.get_context_parallel_rank", return_value=0),
++        patch("verl.models.mcore.util.mpu.get_tensor_model_parallel_world_size", return_value=1),
++    ):
++        projection_mask = preprocess(full_mask, need_roll=True)[0]
++
++    expected = torch.tensor(
++        [
++            [0, 0, 1, 1, 0, 1, 0, 0],
++            [0, 0, 0, 1, 0, 1, 1, 0],
++        ],
++        dtype=torch.bool,
++    )
++    if data_format == "thd":
++        expected = expected.reshape(1, -1)
++    torch.testing.assert_close(projection_mask, expected)
++
++
++def test_projection_hook_gathers_tp_sequence_before_selecting_hidden_states():
++    output_layer = _FakeOutputLayer()
++    model = _Model(output_layer)
++    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
++    gathered = torch.cat((hidden, hidden + 10), dim=0)
++    projection_mask = torch.tensor([[False, True, True, False]])
++
++    with (
++        patch(
++            "megatron.core.tensor_parallel.gather_from_sequence_parallel_region",
++            return_value=gathered,
++        ) as gather,
++        response_only_output_projection(model, projection_mask),
++    ):
++        projected, _ = output_layer(hidden)
++        assert output_layer.sequence_parallel is False
++        assert output_layer.disable_grad_reduce is True
++
++    gather.assert_called_once_with(hidden, tensor_parallel_output_grad=True, group=output_layer.tp_group)
++    expected = torch.stack((gathered[1, 0], gathered[2, 0])).reshape(2, 1, 2)
++    torch.testing.assert_close(projected, expected)
++    assert output_layer.sequence_parallel is True
++    assert output_layer.disable_grad_reduce is False
++
++
++def test_projection_hook_preserves_active_logits_and_gradients_without_sequence_parallelism():
++    torch.manual_seed(7)
++    projection_mask = torch.tensor([[False, True, True, False], [True, False, True, False]])
++    dense_layer = _FakeLinearOutputLayer(hidden_size=3, vocab_size=5)
++    sparse_layer = _FakeLinearOutputLayer(hidden_size=3, vocab_size=5)
++    dense_model = _Model(dense_layer)
++    sparse_model = _Model(sparse_layer)
++    sparse_layer.load_state_dict(dense_layer.state_dict())
++    dense_hidden = torch.randn(4, 2, 3, requires_grad=True)
++    sparse_hidden = dense_hidden.detach().clone().requires_grad_()
++
++    dense_active = dense_model(dense_hidden)[projection_mask]
++    dense_active.square().sum().backward()
++
++    with response_only_output_projection(sparse_model, projection_mask):
++        sparse_logits = sparse_model(sparse_hidden)
++    sparse_logits.square().sum().backward()
++
++    torch.testing.assert_close(sparse_logits[0], dense_active)
++    torch.testing.assert_close(sparse_hidden.grad, dense_hidden.grad)
++    torch.testing.assert_close(sparse_layer.weight.grad, dense_layer.weight.grad)
++
++
++def test_sequence_parallel_output_layer_must_support_disabling_grad_reduction():
++    model = _Model(_FakeOutputLayer(supports_disable_grad_reduce=False))
++    with (
++        pytest.raises(RuntimeError, match="disable_grad_reduce"),
++        response_only_output_projection(model, torch.ones(1, 2, dtype=torch.bool)),
++    ):
++        pass
++
++
++def test_empty_local_response_mask_keeps_a_zero_gradient_path():
++    projection_mask = torch.zeros(1, 4, dtype=torch.bool)
++    model = _Model(_FakeLinearOutputLayer(hidden_size=3, vocab_size=5))
++    hidden = torch.randn(4, 1, 3, requires_grad=True)
++    with response_only_output_projection(model, projection_mask):
++        logits = model(hidden)
++
++    sparse_label, _, num_selected = select_response_only_inputs(
++        torch.arange(4).reshape(1, 4), torch.ones(1, 4), projection_mask
++    )
++    assert num_selected == 0
++    torch.testing.assert_close(sparse_label, torch.zeros(1, 1, dtype=torch.long))
++
++    sparse_output = logits.sum(dim=-1)
++    restored = restore_response_only_outputs({"log_probs": sparse_output}, projection_mask, num_selected)["log_probs"]
++    restored.sum().backward()
++
++    torch.testing.assert_close(restored, torch.zeros_like(restored))
++    assert hidden.grad is not None and model.output_layer.weight.grad is not None
++    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden.grad))
++    torch.testing.assert_close(model.output_layer.weight.grad, torch.zeros_like(model.output_layer.weight.grad))
+diff --git a/tests/workers/config/test_engine_config_on_cpu.py b/tests/workers/config/test_engine_config_on_cpu.py
+index 1253f5c9..0ad8eaa8 100644
+--- a/tests/workers/config/test_engine_config_on_cpu.py
++++ b/tests/workers/config/test_engine_config_on_cpu.py
+@@ -22,6 +22,7 @@ class TestMcoreEngineConfig:
+         config = McoreEngineConfig()
+         assert config.tensor_model_parallel_size == 1
+         assert config.sequence_parallel is False  # Should be auto-corrected
++        assert config.response_only_lm_head is False
+         assert config.seed == 42
+ 
+     def test_post_init_validation(self):
+diff --git a/tests/workers/test_megatron_distillation_only_on_cpu.py b/tests/workers/test_megatron_distillation_only_on_cpu.py
+index 3e399442..3bb51003 100644
+--- a/tests/workers/test_megatron_distillation_only_on_cpu.py
++++ b/tests/workers/test_megatron_distillation_only_on_cpu.py
+@@ -115,3 +115,58 @@ def test_megatron_logits_processor_without_topk_always_computes_log_probs():
+     assert "log_probs" in ret
+     for k in _DISTILLATION_KEYS:
+         assert k not in ret
++
++
++def test_megatron_logits_processor_restores_response_only_outputs():
++    eng = _make_engine_stub()
++    projection_mask = torch.tensor(
++        [
++            [False, True, False, True],
++            [True, False, True, False],
++        ]
++    )
++    label = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]])
++    temperature = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
++    logits_leaf = torch.ones(1, 4, _VOCAB_SIZE, requires_grad=True)
++
++    def log_probs(logits, selected_label):
++        torch.testing.assert_close(selected_label, torch.tensor([[1, 3, 4, 6]]))
++        return logits[..., 0]
++
++    with patch(
++        "verl.workers.engine.megatron.transformer_impl.vocab_parallel_log_probs_from_logits",
++        side_effect=log_probs,
++    ):
++        ret = eng._lm_head_logits_processor(
++            logits_leaf + 0,
++            label,
++            temperature,
++            calculate_sum_pi_squared=False,
++            calculate_entropy=False,
++            distillation_use_topk=False,
++            distillation_only=False,
++            logits_processor_func=_make_logits_processor(_DISTILLATION_KEYS),
++            batch=TensorDict({}, batch_size=[]),
++            data_format="bshd",
++            projection_mask=projection_mask,
++        )
++
++    expected = torch.zeros(2, 4)
++    expected[projection_mask] = 1 / temperature[projection_mask]
++    torch.testing.assert_close(ret["log_probs"], expected)
++
++    weights = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
++    (ret["log_probs"] * weights).sum().backward()
++    expected_grad = torch.zeros_like(logits_leaf)
++    expected_grad[0, :, 0] = weights[projection_mask] / temperature[projection_mask]
++    torch.testing.assert_close(logits_leaf.grad, expected_grad)
++
++
++def test_response_only_lm_head_disables_fused_forward_before_model_patch():
++    eng = object.__new__(MegatronEngineWithLMHead)
++    eng.engine_config = SimpleNamespace(use_fused_kernels=True, response_only_lm_head=True)
++
++    with patch("verl.workers.engine.megatron.transformer_impl.logger.warning_once", create=True):
++        eng._maybe_enable_fused_kernels()
++
++    assert eng.engine_config.use_fused_kernels is False
+diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
+index 6d2a6b29..cedabfb3 100644
+--- a/verl/models/mcore/model_forward.py
++++ b/verl/models/mcore/model_forward.py
+@@ -13,6 +13,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from contextlib import nullcontext
+ from typing import Optional
+ 
+ import torch
+@@ -21,6 +22,7 @@ from torch.nested._internal.nested_tensor import NestedTensor
+ from verl.utils.megatron_utils import unwrap_model
+ from verl.workers.config import MtpConfig
+ 
++from .response_only_lm_head import response_only_output_projection
+ from .util import (
+     build_vlm_attn_mask_bshd,
+     build_vlm_attn_mask_thd,
+@@ -210,8 +212,8 @@ def _convert_to_nested_tensor(v, input_ids_lengths):
+     return v
+ 
+ 
+-def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_attention_mask):
+-    """Build a nested loss_mask aligned to ``input_ids = [prompt; response]`` for MTP.
++def _build_full_loss_mask_nested(response_mask, input_ids_lengths, response_attention_mask):
++    """Build a nested loss_mask aligned to ``input_ids = [prompt; response]``.
+ 
+     ``response_mask`` is response-only data. This expands it to full packed
+     input length as prompt zeros followed by valid response positions.
+@@ -222,7 +224,7 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
+         batch_size = len(response_lengths)
+         response_values = response_mask.values()
+     else:
+-        assert response_attention_mask is not None, "response_attention_mask is required to align padded MTP loss_mask"
++        assert response_attention_mask is not None, "response_attention_mask is required to align a padded loss_mask"
+         assert not isinstance(response_attention_mask, NestedTensor), (
+             "response_attention_mask must be a padded (bs, max_response_len) tensor, got NestedTensor"
+         )
+@@ -272,6 +274,7 @@ def gptmodel_forward_model_engine(
+     pad_token_id=None,
+     data_format: str = "thd",
+     mtp_enable_train: bool = False,
++    response_only_lm_head: bool = False,
+     local_cp_size: Optional[int] = None,
+     forced_max_seqlen: Optional[int] = None,
+     pad_to_length_bucket: Optional[int] = None,
+@@ -284,6 +287,7 @@ def gptmodel_forward_model_engine(
+     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
+     pre_process = unwrap_model(model).pre_process
+     post_process = unwrap_model(model).post_process
++    logits_processor_args = dict(logits_processor_args or {})
+ 
+     fp8 = unwrap_model(model).config.fp8
+     use_fp8_padding = fp8 in ["e4m3", "hybrid"]
+@@ -312,6 +316,26 @@ def gptmodel_forward_model_engine(
+             packed_seq_params._verl_mtp_loss_normalization_factor = mtp_loss_normalization_factor
+         input_ids_rmpad = input_ids_rmpad.contiguous()
+ 
++        projection_mask = None
++        if response_only_lm_head and post_process and logits_processor is not None:
++            if mtp_enable_train:
++                raise NotImplementedError("response_only_lm_head does not support MTP training")
++            input_ids_lengths = input_ids.offsets().diff().tolist()
++            full_loss_mask = _build_full_loss_mask_nested(
++                logits_processor_args["loss_mask"],
++                input_ids_lengths,
++                logits_processor_args.get("response_attention_mask"),
++            )
++            projection_mask = preprocess_thd_engine(
++                full_loss_mask,
++                pre_process=True,
++                need_roll=True,
++                use_fp8_padding=use_fp8_padding,
++                local_cp_size=local_cp_size,
++                pad_to_length_bucket=pad_to_length_bucket,
++                cp_layout=cp_layout,
++            )[0].to(torch.bool)
++
+         args = {}
+         if mtp_enable_train and post_process:
+             # Use input_ids sequence length to ensure label and loss_mask alignment
+@@ -322,7 +346,7 @@ def gptmodel_forward_model_engine(
+             for k in ["label", "loss_mask"]:
+                 v = logits_processor_args[k]
+                 if k == "loss_mask":
+-                    v = _build_mtp_loss_mask_nested(v, input_ids_lengths, response_attention_mask)
++                    v = _build_full_loss_mask_nested(v, input_ids_lengths, response_attention_mask)
+                 else:
+                     v = _convert_to_nested_tensor(v, input_ids_lengths)
+                 logits_processor_args[k] = v
+@@ -352,13 +376,17 @@ def gptmodel_forward_model_engine(
+         if router_padding_mask is not None:
+             model_kwargs["padding_mask"] = router_padding_mask
+ 
+-        output_orig = model(
+-            input_ids=input_ids_rmpad,
+-            attention_mask=attention_mask,
+-            position_ids=position_ids_rmpad if mtp_enable_train else None,  # position_ids is only needed for MTP
+-            packed_seq_params=packed_seq_params,
+-            **model_kwargs,
++        projection_context = (
++            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
+         )
++        with projection_context:
++            output_orig = model(
++                input_ids=input_ids_rmpad,
++                attention_mask=attention_mask,
++                position_ids=position_ids_rmpad if mtp_enable_train else None,  # position_ids is only needed for MTP
++                packed_seq_params=packed_seq_params,
++                **model_kwargs,
++            )
+ 
+         if post_process and logits_processor is not None:
+             args = {
+@@ -373,6 +401,8 @@ def gptmodel_forward_model_engine(
+                 )[0]
+                 for k, v in logits_processor_args.items()
+             }
++            if projection_mask is not None:
++                args["projection_mask"] = projection_mask
+             output_dict = logits_processor(output_orig, **args)
+             output = {
+                 k: postprocess_thd_engine(
+@@ -413,6 +443,24 @@ def gptmodel_forward_model_engine(
+             forced_max_seqlen=forced_max_seqlen,
+         )
+ 
++        projection_mask = None
++        if response_only_lm_head and post_process and logits_processor is not None:
++            if mtp_enable_train:
++                raise NotImplementedError("response_only_lm_head does not support MTP training")
++            input_ids_lengths = input_ids.offsets().diff().tolist()
++            full_loss_mask = _build_full_loss_mask_nested(
++                logits_processor_args["loss_mask"],
++                input_ids_lengths,
++                logits_processor_args.get("response_attention_mask"),
++            )
++            projection_mask = preprocess_bshd_engine(
++                full_loss_mask,
++                pre_process=True,
++                need_roll=True,
++                use_fp8_padding=use_fp8_padding,
++                forced_max_seqlen=forced_max_seqlen,
++            )[0].to(torch.bool)
++
+         if mtp_enable_train and post_process:
+             args = {}
+             # Use input_ids sequence length to ensure label and loss_mask alignment
+@@ -423,7 +471,7 @@ def gptmodel_forward_model_engine(
+             for k in ["label", "loss_mask"]:
+                 v = logits_processor_args[k]
+                 if k == "loss_mask":
+-                    v = _build_mtp_loss_mask_nested(v, input_ids_lengths, response_attention_mask)
++                    v = _build_full_loss_mask_nested(v, input_ids_lengths, response_attention_mask)
+                 else:
+                     v = _convert_to_nested_tensor(v, input_ids_lengths)
+                 logits_processor_args[k] = v
+@@ -450,12 +498,16 @@ def gptmodel_forward_model_engine(
+         else:
+             attention_mask = attention_mask_bshd
+ 
+-        output_orig = model(
+-            input_ids=input_ids_bshd,
+-            attention_mask=attention_mask,
+-            position_ids=None if vision_model else position_ids_bshd,
+-            **model_kwargs,
++        projection_context = (
++            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
+         )
++        with projection_context:
++            output_orig = model(
++                input_ids=input_ids_bshd,
++                attention_mask=attention_mask,
++                position_ids=None if vision_model else position_ids_bshd,
++                **model_kwargs,
++            )
+         if post_process and logits_processor is not None:
+             args = {
+                 k: preprocess_bshd_engine(
+@@ -467,6 +519,8 @@ def gptmodel_forward_model_engine(
+                 )[0]
+                 for k, v in logits_processor_args.items()
+             }
++            if projection_mask is not None:
++                args["projection_mask"] = projection_mask
+             output_dict = logits_processor(output_orig, **args)
+             output = {
+                 k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
+diff --git a/verl/models/mcore/response_only_lm_head.py b/verl/models/mcore/response_only_lm_head.py
+new file mode 100644
+index 00000000..3efc6576
+--- /dev/null
++++ b/verl/models/mcore/response_only_lm_head.py
+@@ -0,0 +1,149 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++
++import torch
++
++
++def _get_output_layer(model):
++    from verl.utils.megatron_utils import unwrap_model
++
++    unwrapped = unwrap_model(model)
++    language_model = getattr(unwrapped, "language_model", None)
++    if language_model is None:
++        language_model = unwrapped
++    output_layer = getattr(language_model, "output_layer", None)
++    if output_layer is None:
++        raise RuntimeError("response_only_lm_head requires a Megatron language model with an output_layer")
++    return output_layer
++
++
++@contextmanager
++def response_only_output_projection(model, projection_mask: torch.Tensor) -> Iterator[None]:
++    """Project only hidden states whose next token contributes to the policy loss.
++
++    ``projection_mask`` is already CP-local and next-token aligned. Megatron's
++    sequence-parallel output layer normally gathers hidden states over TP before
++    projecting them. Gather explicitly, select active rows, and disable the
++    layer's second gather for this invocation.
++    """
++    if projection_mask.ndim != 2:
++        raise ValueError(f"projection_mask must have shape [batch, sequence], got {projection_mask.shape}")
++    if projection_mask.dtype != torch.bool:
++        projection_mask = projection_mask.to(torch.bool)
++
++    output_layer = _get_output_layer(model)
++    sequence_parallel = bool(getattr(output_layer, "sequence_parallel", False))
++    if sequence_parallel and not hasattr(output_layer, "disable_grad_reduce"):
++        raise RuntimeError(
++            "response_only_lm_head requires an output layer that supports disable_grad_reduce "
++            "when sequence parallelism is enabled"
++        )
++    disable_grad_reduce = getattr(output_layer, "disable_grad_reduce", None)
++
++    def select_hidden_states(_module, args, kwargs):
++        if args:
++            hidden_states = args[0]
++        else:
++            hidden_states = kwargs.get("input_")
++            if hidden_states is None:
++                raise RuntimeError("Could not find the LM-head hidden-state input")
++
++        if sequence_parallel:
++            from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
++
++            hidden_states = gather_from_sequence_parallel_region(
++                hidden_states,
++                tensor_parallel_output_grad=True,
++                group=getattr(output_layer, "tp_group", None),
++            )
++
++        expected = (projection_mask.shape[1], projection_mask.shape[0])
++        if hidden_states.shape[:2] != expected:
++            raise RuntimeError(
++                "LM-head hidden states and response projection mask are misaligned: "
++                f"hidden={tuple(hidden_states.shape)}, mask={tuple(projection_mask.shape)}"
++            )
++
++        selected = hidden_states.transpose(0, 1)[projection_mask]
++        if selected.numel() == 0:
++            # Keep every TP/CP rank in the LM-head backward graph. The matching
++            # scalar result is multiplied by zero before it reaches the loss.
++            selected = hidden_states[:1, :1, :].reshape(1, hidden_states.shape[-1])
++        selected = selected.reshape(-1, 1, hidden_states.shape[-1]).contiguous()
++
++        if args:
++            return (selected, *args[1:]), kwargs
++        kwargs["input_"] = selected
++        return args, kwargs
++
++    handle = output_layer.register_forward_pre_hook(select_hidden_states, with_kwargs=True)
++    if sequence_parallel:
++        output_layer.sequence_parallel = False
++        # The explicit gather above owns the reduce-scatter in backward. Avoid
++        # ColumnParallelLinear's non-SP input-gradient all-reduce as well.
++        output_layer.disable_grad_reduce = True
++    try:
++        yield
++    finally:
++        handle.remove()
++        if sequence_parallel:
++            output_layer.sequence_parallel = True
++            output_layer.disable_grad_reduce = disable_grad_reduce
++
++
++def select_response_only_inputs(
++    label: torch.Tensor,
++    temperature: torch.Tensor,
++    projection_mask: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, int]:
++    """Select labels and temperatures aligned with sparse LM-head logits."""
++    if projection_mask.dtype != torch.bool:
++        projection_mask = projection_mask.to(torch.bool)
++    if label.shape != projection_mask.shape or temperature.shape != projection_mask.shape:
++        raise ValueError(
++            "label, temperature, and projection_mask must have identical shapes; "
++            f"got label={label.shape}, temperature={temperature.shape}, mask={projection_mask.shape}"
++        )
++
++    sparse_label = label[projection_mask]
++    sparse_temperature = temperature[projection_mask]
++    num_selected = sparse_label.numel()
++    if num_selected == 0:
++        sparse_label = label.new_zeros(1)
++        sparse_temperature = temperature.new_ones(1)
++    return sparse_label.unsqueeze(0), sparse_temperature.unsqueeze(0), num_selected
++
++
++def restore_response_only_outputs(
++    outputs: dict[str, torch.Tensor], projection_mask: torch.Tensor, num_selected: int
++) -> dict[str, torch.Tensor]:
++    """Scatter sparse per-token outputs back to their CP-local dense layout."""
++    projected_tokens = max(num_selected, 1)
++    restored = {}
++    for name, value in outputs.items():
++        if value.shape[:2] != (1, projected_tokens):
++            raise ValueError(
++                f"Sparse output {name!r} has shape {tuple(value.shape)}; expected prefix (1, {projected_tokens})"
++            )
++        dense = value.new_zeros((*projection_mask.shape, *value.shape[2:]))
++        if num_selected:
++            dense[projection_mask] = value[0]
++        else:
++            # Preserve a zero-gradient path through the LM head on empty CP ranks.
++            dense = dense + value.reshape(-1)[:0].sum()
++        restored[name] = dense
++    return restored
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index f6212520..27c30bf3 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -58,6 +58,7 @@ actor_rollout_ref:
+       use_dist_checkpointing: false
+       dist_checkpointing_path: null
+       dynamic_context_parallel: false
++      response_only_lm_head: false
+       max_seqlen_per_dp_cp_rank: null
+       dist_checkpointing_prefix: ''
+       dist_ckpt_optim_fully_reshardable: false
+@@ -268,6 +269,7 @@ actor_rollout_ref:
+       use_dist_checkpointing: false
+       dist_checkpointing_path: null
+       dynamic_context_parallel: ${oc.select:actor_rollout_ref.actor.megatron.dynamic_context_parallel,False}
++      response_only_lm_head: false
+       max_seqlen_per_dp_cp_rank: ${oc.select:actor_rollout_ref.actor.megatron.max_seqlen_per_dp_cp_rank,null}
+       dist_checkpointing_prefix: ''
+       dist_ckpt_optim_fully_reshardable: false
+@@ -600,6 +602,7 @@ critic:
+     use_dist_checkpointing: false
+     dist_checkpointing_path: null
+     dynamic_context_parallel: false
++    response_only_lm_head: false
+     max_seqlen_per_dp_cp_rank: null
+     dist_checkpointing_prefix: ''
+     dist_ckpt_optim_fully_reshardable: false
+diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
+index f1e2ba40..21fb1d82 100644
+--- a/verl/trainer/config/engine/megatron.yaml
++++ b/verl/trainer/config/engine/megatron.yaml
+@@ -43,6 +43,10 @@ dist_checkpointing_path: null
+ # Whether to use dynamic context parallel scheduling
+ dynamic_context_parallel: False
+ 
++# Project the LM head only for next-token-aligned positions selected by loss_mask.
++# Scalar log-probability and entropy outputs retain the regular sequence layout.
++response_only_lm_head: False
++
+ # Maximum packed sequence length per DPxCP rank. A positive integer is required
+ # when dynamic_context_parallel=True.
+ max_seqlen_per_dp_cp_rank: null
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 5df864ab..aa7ffb93 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -164,6 +164,8 @@ class McoreEngineConfig(EngineConfig):
+             for interleaved scheduling.
+         context_parallel_size (int): Context parallel size for long sequences.
+         dynamic_context_parallel (bool): Whether to enable dynamic context parallel scheduling.
++        response_only_lm_head (bool): Project LM-head logits only for response tokens selected by
++            the policy loss mask, then restore the original scalar-output layout.
+         max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
+         sequence_parallel (bool): Whether to enable sequence parallelism.
+         use_distributed_optimizer (bool): Whether to use distributed optimizer.
+@@ -192,6 +194,7 @@ class McoreEngineConfig(EngineConfig):
+     virtual_pipeline_model_parallel_size: Optional[int] = None
+     context_parallel_size: int = 1
+     dynamic_context_parallel: bool = False
++    response_only_lm_head: bool = False
+     entropy_from_logits_with_chunking: bool = False
+     entropy_from_logits_chunk_size: int = 2048
+     max_seqlen_per_dp_cp_rank: Optional[int] = None
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index e8a6c560..a2f0c129 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -28,6 +28,10 @@ from tensordict import TensorDict
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl.models.mcore import get_mcore_weight_converter
++from verl.models.mcore.response_only_lm_head import (
++    restore_response_only_outputs,
++    select_response_only_inputs,
++)
+ from verl.trainer.config import CheckpointConfig
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+@@ -514,6 +518,13 @@ class MegatronEngine(BaseEngine):
+         if not self.engine_config.use_fused_kernels:
+             return
+ 
++        if self.engine_config.response_only_lm_head:
++            logger.warning_once(
++                "response_only_lm_head requires the unfused Megatron forward path; disabling fused kernels"
++            )
++            self.engine_config.use_fused_kernels = False
++            return
++
+         if not self.engine_config.use_remove_padding or self.is_value_model or self.model_config.mtp.enable:
+             logger.warning_once(
+                 "Fused kernels require remove-padding and are not supported for value models or when MTP is enabled "
+@@ -1183,8 +1194,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         logits_processor_func: Callable,
+         batch: TensorDict,
+         data_format: str,
++        projection_mask: torch.Tensor | None = None,
+     ):
+-        assert logits.shape[:2] == label.shape[:2]
++        num_selected = None
++        if projection_mask is not None:
++            label, temperature, num_selected = select_response_only_inputs(label, temperature, projection_mask)
++        if logits.ndim != 3 or logits.shape[:2] != label.shape:
++            raise ValueError(f"logits and labels are misaligned: logits={logits.shape}, label={label.shape}")
+         # avoid non-positive temperature such as padding
+         temperature[temperature <= 0] = 1e-8
+         assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
+@@ -1220,6 +1236,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         if not distillation_only:
+             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
+ 
++        if projection_mask is not None:
++            ret = restore_response_only_outputs(ret, projection_mask, num_selected)
+         return ret
+ 
+     def forward_step(
+@@ -1240,6 +1258,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
+         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
++
++        if self.engine_config.response_only_lm_head and distillation_use_topk:
++            raise NotImplementedError("response_only_lm_head does not support top-k distillation")
++        if (
++            self.engine_config.response_only_lm_head
++            and self.model_config.mtp.enable
++            and self.model_config.mtp.enable_train
++        ):
++            raise NotImplementedError("response_only_lm_head does not support MTP training")
+         pad_to_length_bucket = (
+             self.engine_config.pad_to_length_bucket
+             if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
+@@ -1381,6 +1408,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                 data_format=data_format,
+                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
++                response_only_lm_head=self.engine_config.response_only_lm_head,
+                 local_cp_size=local_cp_size,
+                 router_padding_mask=router_padding_mask,
+                 mtp_loss_normalization_factor=mtp_loss_normalization_factor,
+-- 
+2.51.0.windows.2
+

@@ -1,0 +1,780 @@
+From 45251f244d7b7475c5a02b28400ce1035f0258a0 Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Thu, 20 Aug 2026 17:01:07 +0800
+Subject: [PATCH 2/2] [megatron, perf] test: profile response-only LM-head
+ savings
+
+Add opt-in synchronized timing and accelerator-memory diagnostics around the LM-head and vocabulary-processing region, plus an A/B log summarizer and focused CPU coverage.
+
+Assisted-by: OpenAI Codex
+---
+ docs/perf/perf_tuning.rst                     |  25 +++
+ .../summarize_response_only_lm_head.py        | 204 ++++++++++++++++++
+ .../test_response_only_lm_head_on_cpu.py      |  41 ++++
+ ...nse_only_lm_head_profile_summary_on_cpu.py |  94 ++++++++
+ verl/models/mcore/model_forward.py            |  68 ++++--
+ .../mcore/response_only_lm_head_profile.py    | 144 +++++++++++++
+ .../engine/megatron/transformer_impl.py       |  29 ++-
+ 7 files changed, 585 insertions(+), 20 deletions(-)
+ create mode 100644 examples/profile/summarize_response_only_lm_head.py
+ create mode 100644 tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
+ create mode 100644 verl/models/mcore/response_only_lm_head_profile.py
+
+diff --git a/docs/perf/perf_tuning.rst b/docs/perf/perf_tuning.rst
+index 374d901d..bd492f91 100644
+--- a/docs/perf/perf_tuning.rst
++++ b/docs/perf/perf_tuning.rst
+@@ -267,3 +267,28 @@ The expected LM-head logits reduction is proportional to the active-row ratio
+ ``loss_mask.sum() / input_tokens``. This option uses the unfused forward path
+ and currently does not support MTP training or top-k distillation. It is most
+ useful when the active-row ratio is low and the vocabulary is large.
++
++Profiling response-only LM-head savings
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Run dedicated baseline and optimized jobs with the unfused Megatron path and
++the following environment variable::
++
++    VERL_RESPONSE_ONLY_LM_HEAD_PROFILE=1
++
++Use identical inputs and set ``response_only_lm_head=False`` for the baseline
++and ``True`` for the optimized run. The profiler emits one
++``VERL_RESPONSE_ONLY_LM_HEAD_PROFILE`` JSON record per LM-head invocation on
++each rank of the final pipeline stage. Each record contains the active-row
++ratio, synchronized LM-head plus forward vocabulary-processing latency, actual
++and dense-equivalent local logits bytes, and accelerator peak allocation over
++that measured region. It does not measure backward, optimizer, end-to-end step
++time, or process-wide training peak memory.
++
++The profiler synchronizes the accelerator and resets peak-memory statistics at
++the LM-head boundary. This is intentional for controlled A/B measurement but
++perturbs performance and process-wide peak-memory counters, so do not enable it
++during production training. Summarize two captured logs with::
++
++    python examples/profile/summarize_response_only_lm_head.py \
++        --baseline baseline.log --optimized response_only.log --warmup 2
+diff --git a/examples/profile/summarize_response_only_lm_head.py b/examples/profile/summarize_response_only_lm_head.py
+new file mode 100644
+index 00000000..623ce490
+--- /dev/null
++++ b/examples/profile/summarize_response_only_lm_head.py
+@@ -0,0 +1,204 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import argparse
++import json
++import math
++import statistics
++from collections import defaultdict
++from pathlib import Path
++
++PREFIX = "VERL_RESPONSE_ONLY_LM_HEAD_PROFILE "
++GIB = 1024**3
++GROUP_FIELDS = (
++    "role",
++    "data_format",
++    "calculate_entropy",
++    "entropy_from_logits_with_chunking",
++    "entropy_from_logits_chunk_size",
++    "calculate_sum_pi_squared",
++    "distillation_only",
++    "tensor_parallel_size",
++    "context_parallel_size",
++    "pipeline_parallel_size",
++    "logits_dtype",
++    "vocab_shard",
++)
++
++
++def load_records(path: Path) -> list[dict]:
++    records = []
++    decoder = json.JSONDecoder()
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        start = line.find(PREFIX)
++        if start >= 0:
++            record, _ = decoder.raw_decode(line[start + len(PREFIX) :])
++            records.append(record)
++    if not records:
++        raise ValueError(f"no {PREFIX.strip()} records found in {path}")
++    return records
++
++
++def percentile(values: list[float], q: float) -> float:
++    values = sorted(values)
++    if len(values) == 1:
++        return values[0]
++    position = (len(values) - 1) * q
++    lower = int(position)
++    upper = min(lower + 1, len(values) - 1)
++    weight = position - lower
++    return values[lower] * (1 - weight) + values[upper] * weight
++
++
++def group_key(record: dict) -> tuple:
++    return tuple(record.get(field) for field in GROUP_FIELDS)
++
++
++def validate_records(records: list[dict], *, response_only_enabled: bool) -> None:
++    modes = {bool(record["response_only_enabled"]) for record in records}
++    if modes != {response_only_enabled}:
++        raise ValueError(f"expected response_only_enabled={response_only_enabled}, found {sorted(modes)}")
++
++
++def discard_warmup(records: list[dict], warmup: int) -> list[dict]:
++    by_stream = defaultdict(list)
++    for record in records:
++        by_stream[(group_key(record), record["rank"])].append(record)
++
++    measured = []
++    for rows in by_stream.values():
++        rows.sort(key=lambda row: row["event_id"])
++        measured.extend(rows[warmup:])
++    if not measured:
++        raise ValueError(f"no profile stream has more than {warmup} warmup samples")
++    return measured
++
++
++def _median_optional(records: list[dict], field: str) -> float | None:
++    values = [record[field] for record in records if record.get(field) is not None]
++    return statistics.median(values) if values else None
++
++
++def summarize(records: list[dict], warmup: int) -> dict[tuple, dict]:
++    grouped = defaultdict(list)
++    for record in discard_warmup(records, warmup):
++        grouped[group_key(record)].append(record)
++
++    summary = {}
++    for key, rows in grouped.items():
++        elapsed = [row["elapsed_s"] for row in rows]
++        summary[key] = {
++            "samples": len(rows),
++            "ranks": len({row["rank"] for row in rows}),
++            "active_ratio": statistics.median(row["active_ratio"] for row in rows),
++            "latency_p50_s": percentile(elapsed, 0.5),
++            "latency_p95_s": percentile(elapsed, 0.95),
++            "dense_logits_gib": statistics.median(row["dense_logits_bytes"] for row in rows) / GIB,
++            "actual_logits_gib": statistics.median(row["actual_logits_bytes"] for row in rows) / GIB,
++            "logits_saved_gib": statistics.median(row["logits_saved_bytes"] for row in rows) / GIB,
++            "peak_increment_gib": (
++                value / GIB if (value := _median_optional(rows, "peak_increment_bytes")) is not None else None
++            ),
++            "peak_allocated_gib": (
++                value / GIB if (value := _median_optional(rows, "peak_allocated_bytes")) is not None else None
++            ),
++        }
++    return summary
++
++
++def _optional(value: float | None) -> str:
++    return "-" if value is None else f"{value:.3f}"
++
++
++def print_summary(name: str, summary: dict) -> None:
++    print(f"\n{name}")
++    print(
++        "\t".join(GROUP_FIELDS) + "\tn\tranks\tactive_pct\tlatency_p50_ms\tlatency_p95_ms\t"
++        "dense_logits_GiB\tactual_logits_GiB\tlogits_saved_GiB\tpeak_increment_GiB\tpeak_allocated_GiB"
++    )
++    for key, row in sorted(summary.items()):
++        print(
++            "\t".join(map(str, key)) + f"\t{row['samples']}\t{row['ranks']}\t"
++            f"{100 * row['active_ratio']:.2f}\t{1000 * row['latency_p50_s']:.3f}\t"
++            f"{1000 * row['latency_p95_s']:.3f}\t{row['dense_logits_gib']:.3f}\t"
++            f"{row['actual_logits_gib']:.3f}\t{row['logits_saved_gib']:.3f}\t"
++            f"{_optional(row['peak_increment_gib'])}\t{_optional(row['peak_allocated_gib'])}"
++        )
++
++
++def compare(baseline: dict, optimized: dict) -> dict[tuple, dict]:
++    if baseline.keys() != optimized.keys():
++        raise ValueError(
++            "profile groups differ: "
++            f"missing from optimized={sorted(baseline.keys() - optimized.keys())}, "
++            f"missing from baseline={sorted(optimized.keys() - baseline.keys())}"
++        )
++
++    comparison = {}
++    for key in baseline:
++        before = baseline[key]
++        after = optimized[key]
++        for field in ("samples", "ranks"):
++            if before[field] != after[field]:
++                raise ValueError(f"profile {field} differ for {key}: {before[field]} != {after[field]}")
++        if not math.isclose(before["active_ratio"], after["active_ratio"], rel_tol=0, abs_tol=1e-12):
++            raise ValueError(
++                f"profile active ratios differ for {key}: {before['active_ratio']} != {after['active_ratio']}"
++            )
++        if before["dense_logits_gib"] != after["dense_logits_gib"]:
++            raise ValueError(
++                f"profile dense logits sizes differ for {key}: "
++                f"{before['dense_logits_gib']} != {after['dense_logits_gib']}"
++            )
++        peak_saved = None
++        if before["peak_increment_gib"] is not None and after["peak_increment_gib"] is not None:
++            peak_saved = before["peak_increment_gib"] - after["peak_increment_gib"]
++        comparison[key] = {
++            "forward_latency_reduction_pct": 100 * (1 - after["latency_p50_s"] / before["latency_p50_s"]),
++            "logits_saved_gib": before["actual_logits_gib"] - after["actual_logits_gib"],
++            "peak_increment_saved_gib": peak_saved,
++        }
++    return comparison
++
++
++def print_comparison(comparison: dict) -> None:
++    print("\nbaseline -> response-only")
++    print("\t".join(GROUP_FIELDS) + "\tforward_latency_reduction_pct\tlogits_saved_GiB\tpeak_increment_saved_GiB")
++    for key, row in sorted(comparison.items()):
++        print(
++            "\t".join(map(str, key)) + f"\t{row['forward_latency_reduction_pct']:.2f}\t"
++            f"{row['logits_saved_gib']:.3f}\t{_optional(row['peak_increment_saved_gib'])}"
++        )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Summarize Response-only Megatron LM-head A/B profile logs.")
++    parser.add_argument("--baseline", type=Path, required=True)
++    parser.add_argument("--optimized", type=Path, required=True)
++    parser.add_argument("--warmup", type=int, default=2)
++    args = parser.parse_args()
++
++    baseline_records = load_records(args.baseline)
++    optimized_records = load_records(args.optimized)
++    validate_records(baseline_records, response_only_enabled=False)
++    validate_records(optimized_records, response_only_enabled=True)
++    baseline = summarize(baseline_records, args.warmup)
++    optimized = summarize(optimized_records, args.warmup)
++    print_summary("baseline", baseline)
++    print_summary("response-only", optimized)
++    print_comparison(compare(baseline, optimized))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/models/mcore/test_response_only_lm_head_on_cpu.py b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
+index a5cc3ec3..5a9155e6 100644
+--- a/tests/models/mcore/test_response_only_lm_head_on_cpu.py
++++ b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json
++from contextlib import nullcontext
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -23,6 +25,10 @@ from verl.models.mcore.response_only_lm_head import (
+     restore_response_only_outputs,
+     select_response_only_inputs,
+ )
++from verl.models.mcore.response_only_lm_head_profile import (
++    PROFILE_PREFIX,
++    ResponseOnlyLMHeadProfiler,
++)
+ from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
+ 
+ 
+@@ -182,3 +188,38 @@ def test_empty_local_response_mask_keeps_a_zero_gradient_path():
+     assert hidden.grad is not None and model.output_layer.weight.grad is not None
+     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden.grad))
+     torch.testing.assert_close(model.output_layer.weight.grad, torch.zeros_like(model.output_layer.weight.grad))
++
++
++@pytest.mark.parametrize(("enabled", "projected_rows"), [(False, 8), (True, 4)])
++def test_profiler_records_projection_rows_and_logits_memory(enabled, projected_rows):
++    model = _Model(_FakeLinearOutputLayer(hidden_size=3, vocab_size=5))
++    hidden = torch.randn(4, 2, 3)
++    projection_mask = torch.tensor([[False, True, True, False], [True, False, True, False]])
++    profiler = ResponseOnlyLMHeadProfiler(
++        model,
++        projection_mask,
++        response_only_enabled=enabled,
++        metadata={"role": "actor", "calculate_entropy": True},
++    )
++    projection = response_only_output_projection(model, projection_mask) if enabled else nullcontext()
++
++    with patch("verl.models.mcore.response_only_lm_head_profile.logger.warning") as warning:
++        with profiler, projection:
++            logits = model(hidden)
++        record = profiler.finish()
++
++    warning.assert_called_once()
++    fmt, prefix, payload = warning.call_args.args
++    assert (fmt, prefix) == ("%s%s", PROFILE_PREFIX)
++    assert json.loads(payload) == record
++    assert record["response_only_enabled"] is enabled
++    assert record["role"] == "actor"
++    assert record["calculate_entropy"] is True
++    assert record["dense_rows"] == 8
++    assert record["selected_rows"] == 4
++    assert record["projected_rows"] == projected_rows
++    assert record["active_ratio"] == 0.5
++    assert record["vocab_shard"] == 5
++    assert record["dense_logits_bytes"] == 8 * 5 * logits.element_size()
++    assert record["actual_logits_bytes"] == projected_rows * 5 * logits.element_size()
++    assert record["logits_saved_bytes"] == (8 - projected_rows) * 5 * logits.element_size()
+diff --git a/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py b/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
+new file mode 100644
+index 00000000..87f561d2
+--- /dev/null
++++ b/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
+@@ -0,0 +1,94 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++
++import pytest
++
++from examples.profile import summarize_response_only_lm_head as summary
++
++
++def _record(rank, event_id, *, enabled, elapsed, actual_bytes, peak_increment=100):
++    dense_bytes = 1000
++    return {
++        "event_id": event_id,
++        "rank": rank,
++        "response_only_enabled": enabled,
++        "role": "actor",
++        "data_format": "thd",
++        "calculate_entropy": True,
++        "entropy_from_logits_with_chunking": False,
++        "entropy_from_logits_chunk_size": 2048,
++        "calculate_sum_pi_squared": False,
++        "distillation_only": False,
++        "tensor_parallel_size": 2,
++        "context_parallel_size": 4,
++        "pipeline_parallel_size": 1,
++        "logits_dtype": "torch.bfloat16",
++        "vocab_shard": 128,
++        "active_ratio": 0.25,
++        "elapsed_s": elapsed,
++        "dense_logits_bytes": dense_bytes,
++        "actual_logits_bytes": actual_bytes,
++        "logits_saved_bytes": dense_bytes - actual_bytes,
++        "peak_increment_bytes": peak_increment,
++        "peak_allocated_bytes": 2000,
++    }
++
++
++def test_log_summary_discards_warmup_per_rank_and_compares(tmp_path):
++    baseline_records = []
++    optimized_records = []
++    for rank in range(2):
++        baseline_records.extend(
++            [
++                _record(rank, 0, enabled=False, elapsed=9.0, actual_bytes=1000),
++                _record(rank, 1, enabled=False, elapsed=2.0 + rank, actual_bytes=1000, peak_increment=500),
++            ]
++        )
++        optimized_records.extend(
++            [
++                _record(rank, 0, enabled=True, elapsed=9.0, actual_bytes=250),
++                _record(rank, 1, enabled=True, elapsed=0.5 + 0.25 * rank, actual_bytes=250, peak_increment=200),
++            ]
++        )
++
++    paths = {"baseline": tmp_path / "baseline.log", "optimized": tmp_path / "optimized.log"}
++    for name, records in (("baseline", baseline_records), ("optimized", optimized_records)):
++        lines = [f"worker | {summary.PREFIX}{json.dumps(record)}" for record in records]
++        paths[name].write_text("\n".join(lines), encoding="utf-8")
++
++    baseline = summary.summarize(summary.load_records(paths["baseline"]), warmup=1)
++    optimized = summary.summarize(summary.load_records(paths["optimized"]), warmup=1)
++    key = summary.group_key(baseline_records[0])
++    result = summary.compare(baseline, optimized)[key]
++
++    assert baseline[key]["samples"] == optimized[key]["samples"] == 2
++    assert result["forward_latency_reduction_pct"] == pytest.approx(75.0)
++    assert result["logits_saved_gib"] == pytest.approx(750 / summary.GIB)
++    assert result["peak_increment_saved_gib"] == pytest.approx(300 / summary.GIB)
++
++    optimized[key]["dense_logits_gib"] *= 2
++    with pytest.raises(ValueError, match="dense logits sizes differ"):
++        summary.compare(baseline, optimized)
++
++
++def test_validate_records_rejects_mixed_modes():
++    records = [
++        _record(0, 0, enabled=False, elapsed=1.0, actual_bytes=1000),
++        _record(0, 1, enabled=True, elapsed=1.0, actual_bytes=250),
++    ]
++
++    with pytest.raises(ValueError, match="expected response_only_enabled=False"):
++        summary.validate_records(records, response_only_enabled=False)
+diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
+index cedabfb3..941dd3b4 100644
+--- a/verl/models/mcore/model_forward.py
++++ b/verl/models/mcore/model_forward.py
+@@ -13,7 +13,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-from contextlib import nullcontext
++from contextlib import ExitStack, contextmanager
+ from typing import Optional
+ 
+ import torch
+@@ -263,6 +263,31 @@ def _build_full_loss_mask_nested(response_mask, input_ids_lengths, response_atte
+     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
+ 
+ 
++@contextmanager
++def _response_only_lm_head_context(model, projection_mask, enabled, profile_metadata):
++    """Install response-only projection and optional profiling for one forward."""
++    if projection_mask is None:
++        yield None
++        return
++
++    with ExitStack() as stack:
++        profiler = None
++        if profile_metadata is not None:
++            from .response_only_lm_head_profile import ResponseOnlyLMHeadProfiler
++
++            profiler = stack.enter_context(
++                ResponseOnlyLMHeadProfiler(
++                    model,
++                    projection_mask,
++                    response_only_enabled=enabled,
++                    metadata=profile_metadata,
++                )
++            )
++        if enabled:
++            stack.enter_context(response_only_output_projection(model, projection_mask))
++        yield profiler
++
++
+ def gptmodel_forward_model_engine(
+     model,
+     input_ids,
+@@ -275,6 +300,7 @@ def gptmodel_forward_model_engine(
+     data_format: str = "thd",
+     mtp_enable_train: bool = False,
+     response_only_lm_head: bool = False,
++    response_only_lm_head_profile: dict | None = None,
+     local_cp_size: Optional[int] = None,
+     forced_max_seqlen: Optional[int] = None,
+     pad_to_length_bucket: Optional[int] = None,
+@@ -317,9 +343,14 @@ def gptmodel_forward_model_engine(
+         input_ids_rmpad = input_ids_rmpad.contiguous()
+ 
+         projection_mask = None
+-        if response_only_lm_head and post_process and logits_processor is not None:
++        if (
++            (response_only_lm_head or response_only_lm_head_profile is not None)
++            and post_process
++            and logits_processor is not None
++        ):
+             if mtp_enable_train:
+-                raise NotImplementedError("response_only_lm_head does not support MTP training")
++                feature = "response_only_lm_head" if response_only_lm_head else "response_only_lm_head profiling"
++                raise NotImplementedError(f"{feature} does not support MTP training")
+             input_ids_lengths = input_ids.offsets().diff().tolist()
+             full_loss_mask = _build_full_loss_mask_nested(
+                 logits_processor_args["loss_mask"],
+@@ -376,10 +407,9 @@ def gptmodel_forward_model_engine(
+         if router_padding_mask is not None:
+             model_kwargs["padding_mask"] = router_padding_mask
+ 
+-        projection_context = (
+-            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
+-        )
+-        with projection_context:
++        with _response_only_lm_head_context(
++            model, projection_mask, response_only_lm_head, response_only_lm_head_profile
++        ) as lm_head_profiler:
+             output_orig = model(
+                 input_ids=input_ids_rmpad,
+                 attention_mask=attention_mask,
+@@ -401,9 +431,11 @@ def gptmodel_forward_model_engine(
+                 )[0]
+                 for k, v in logits_processor_args.items()
+             }
+-            if projection_mask is not None:
++            if response_only_lm_head and projection_mask is not None:
+                 args["projection_mask"] = projection_mask
+             output_dict = logits_processor(output_orig, **args)
++            if lm_head_profiler is not None:
++                lm_head_profiler.finish()
+             output = {
+                 k: postprocess_thd_engine(
+                     v,
+@@ -444,9 +476,14 @@ def gptmodel_forward_model_engine(
+         )
+ 
+         projection_mask = None
+-        if response_only_lm_head and post_process and logits_processor is not None:
++        if (
++            (response_only_lm_head or response_only_lm_head_profile is not None)
++            and post_process
++            and logits_processor is not None
++        ):
+             if mtp_enable_train:
+-                raise NotImplementedError("response_only_lm_head does not support MTP training")
++                feature = "response_only_lm_head" if response_only_lm_head else "response_only_lm_head profiling"
++                raise NotImplementedError(f"{feature} does not support MTP training")
+             input_ids_lengths = input_ids.offsets().diff().tolist()
+             full_loss_mask = _build_full_loss_mask_nested(
+                 logits_processor_args["loss_mask"],
+@@ -498,10 +535,9 @@ def gptmodel_forward_model_engine(
+         else:
+             attention_mask = attention_mask_bshd
+ 
+-        projection_context = (
+-            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
+-        )
+-        with projection_context:
++        with _response_only_lm_head_context(
++            model, projection_mask, response_only_lm_head, response_only_lm_head_profile
++        ) as lm_head_profiler:
+             output_orig = model(
+                 input_ids=input_ids_bshd,
+                 attention_mask=attention_mask,
+@@ -519,9 +555,11 @@ def gptmodel_forward_model_engine(
+                 )[0]
+                 for k, v in logits_processor_args.items()
+             }
+-            if projection_mask is not None:
++            if response_only_lm_head and projection_mask is not None:
+                 args["projection_mask"] = projection_mask
+             output_dict = logits_processor(output_orig, **args)
++            if lm_head_profiler is not None:
++                lm_head_profiler.finish()
+             output = {
+                 k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
+                 for k, v in output_dict.items()
+diff --git a/verl/models/mcore/response_only_lm_head_profile.py b/verl/models/mcore/response_only_lm_head_profile.py
+new file mode 100644
+index 00000000..55d91e79
+--- /dev/null
++++ b/verl/models/mcore/response_only_lm_head_profile.py
+@@ -0,0 +1,144 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import itertools
++import json
++import logging
++import time
++
++import torch
++
++from verl.utils.device import get_torch_device
++
++from .response_only_lm_head import _get_output_layer
++
++logger = logging.getLogger(__name__)
++
++PROFILE_PREFIX = "VERL_RESPONSE_ONLY_LM_HEAD_PROFILE "
++_EVENT_IDS = itertools.count()
++
++
++class ResponseOnlyLMHeadProfiler:
++    """Profile the LM-head projection and its downstream vocabulary operations.
++
++    This helper is intended for controlled A/B runs. On accelerator devices it
++    synchronizes execution and resets peak-memory statistics immediately before
++    the output projection. Normal training never constructs this object.
++    """
++
++    def __init__(
++        self,
++        model,
++        projection_mask: torch.Tensor,
++        *,
++        response_only_enabled: bool,
++        metadata: dict | None = None,
++    ):
++        self.output_layer = _get_output_layer(model)
++        self.projection_mask = projection_mask
++        self.response_only_enabled = response_only_enabled
++        self.metadata = dict(metadata or {})
++        self.event_id = next(_EVENT_IDS)
++        self.selected_rows = int(projection_mask.sum().item())
++        self.dense_rows = projection_mask.numel()
++        self._pre_handle = None
++        self._post_handle = None
++        self._started_at = None
++        self._record = None
++
++        device = get_torch_device()
++        self._device = device
++        self._tracks_accelerator_memory = bool(device.is_available()) and all(
++            hasattr(device, name)
++            for name in ("memory_allocated", "max_memory_allocated", "reset_peak_memory_stats", "synchronize")
++        )
++
++    @staticmethod
++    def _logits_from_output(output) -> torch.Tensor:
++        logits = output[0] if isinstance(output, tuple | list) else output
++        if not isinstance(logits, torch.Tensor) or logits.ndim < 2:
++            raise RuntimeError("Could not identify the tensor returned by the Megatron output layer")
++        return logits
++
++    def _before_projection(self, _module, _args, _kwargs):
++        allocated_before = None
++        if self._tracks_accelerator_memory:
++            self._device.synchronize()
++            allocated_before = self._device.memory_allocated()
++            self._device.reset_peak_memory_stats()
++        self._started_at = time.perf_counter()
++        self._record = {"allocated_before_bytes": allocated_before}
++
++    def _after_projection(self, _module, _args, _kwargs, output):
++        logits = self._logits_from_output(output)
++        vocab_shard = logits.shape[-1]
++        projected_rows = logits.numel() // vocab_shard
++        element_size = logits.element_size()
++        self._record.update(
++            {
++                "projected_rows": projected_rows,
++                "vocab_shard": vocab_shard,
++                "logits_dtype": str(logits.dtype),
++                "element_size": element_size,
++                "actual_logits_bytes": logits.numel() * element_size,
++                "dense_logits_bytes": self.dense_rows * vocab_shard * element_size,
++            }
++        )
++
++    def __enter__(self):
++        # Register before response_only_output_projection so the timer includes
++        # explicit SP gather, row selection, and the vocabulary projection.
++        self._pre_handle = self.output_layer.register_forward_pre_hook(self._before_projection, with_kwargs=True)
++        self._post_handle = self.output_layer.register_forward_hook(self._after_projection, with_kwargs=True)
++        return self
++
++    def finish(self) -> dict:
++        """Finish the sample after log-probability/entropy processing and emit JSON."""
++        if self._record is None or self._started_at is None:
++            raise RuntimeError("LM-head profiler did not observe an output-layer invocation")
++        if "actual_logits_bytes" not in self._record:
++            raise RuntimeError("LM-head profiler did not observe output-layer logits")
++
++        peak_allocated = None
++        peak_increment = None
++        if self._tracks_accelerator_memory:
++            self._device.synchronize()
++            peak_allocated = self._device.max_memory_allocated()
++            peak_increment = max(0, peak_allocated - self._record["allocated_before_bytes"])
++        elapsed_s = time.perf_counter() - self._started_at
++
++        dense_logits_bytes = self._record["dense_logits_bytes"]
++        actual_logits_bytes = self._record["actual_logits_bytes"]
++        record = {
++            **self.metadata,
++            "event_id": self.event_id,
++            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
++            "response_only_enabled": self.response_only_enabled,
++            "dense_rows": self.dense_rows,
++            "selected_rows": self.selected_rows,
++            "active_ratio": self.selected_rows / self.dense_rows if self.dense_rows else 0.0,
++            "elapsed_s": elapsed_s,
++            "peak_allocated_bytes": peak_allocated,
++            "peak_increment_bytes": peak_increment,
++            "logits_saved_bytes": dense_logits_bytes - actual_logits_bytes,
++            **self._record,
++        }
++        logger.warning("%s%s", PROFILE_PREFIX, json.dumps(record, sort_keys=True))
++        return record
++
++    def __exit__(self, _exc_type, _exc_value, _traceback):
++        if self._post_handle is not None:
++            self._post_handle.remove()
++        if self._pre_handle is not None:
++            self._pre_handle.remove()
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index a2f0c129..caa91420 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -1258,15 +1258,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
+         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
++        profile_response_only_lm_head = os.getenv("VERL_RESPONSE_ONLY_LM_HEAD_PROFILE") == "1"
+ 
+         if self.engine_config.response_only_lm_head and distillation_use_topk:
+             raise NotImplementedError("response_only_lm_head does not support top-k distillation")
+-        if (
+-            self.engine_config.response_only_lm_head
+-            and self.model_config.mtp.enable
+-            and self.model_config.mtp.enable_train
+-        ):
++        mtp_training = self.model_config.mtp.enable and self.model_config.mtp.enable_train
++        if self.engine_config.response_only_lm_head and mtp_training:
+             raise NotImplementedError("response_only_lm_head does not support MTP training")
++        if profile_response_only_lm_head and mtp_training:
++            raise NotImplementedError("response_only_lm_head profiling does not support MTP training")
++        if profile_response_only_lm_head and use_fused_kernels:
++            raise RuntimeError(
++                "VERL_RESPONSE_ONLY_LM_HEAD_PROFILE requires the unfused Megatron path; set use_fused_kernels=False"
++            )
+         pad_to_length_bucket = (
+             self.engine_config.pad_to_length_bucket
+             if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
+@@ -1386,6 +1390,20 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 "loss_mask": loss_mask,
+                 "response_attention_mask": response_attention_mask,
+             }
++            response_only_lm_head_profile = None
++            if profile_response_only_lm_head:
++                response_only_lm_head_profile = {
++                    "role": "ref" if self.engine_config.forward_only else "actor",
++                    "data_format": data_format,
++                    "calculate_entropy": bool(calculate_entropy),
++                    "entropy_from_logits_with_chunking": self.engine_config.entropy_from_logits_with_chunking,
++                    "entropy_from_logits_chunk_size": self.engine_config.entropy_from_logits_chunk_size,
++                    "calculate_sum_pi_squared": bool(calculate_sum_pi_squared),
++                    "distillation_only": bool(distillation_only),
++                    "tensor_parallel_size": self.engine_config.tensor_model_parallel_size,
++                    "context_parallel_size": local_cp_size or self.engine_config.context_parallel_size,
++                    "pipeline_parallel_size": self.engine_config.pipeline_model_parallel_size,
++                }
+ 
+             mtp_loss_normalization_factor = None
+             if (
+@@ -1409,6 +1427,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 data_format=data_format,
+                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+                 response_only_lm_head=self.engine_config.response_only_lm_head,
++                response_only_lm_head_profile=response_only_lm_head_profile,
+                 local_cp_size=local_cp_size,
+                 router_padding_mask=router_padding_mask,
+                 mtp_loss_normalization_factor=mtp_loss_normalization_factor,
+-- 
+2.51.0.windows.2
+
