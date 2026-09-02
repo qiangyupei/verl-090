@@ -108,17 +108,117 @@ postprocessing and downstream PPO loss code remain unchanged.
 
 ### Test
 
-Focused CPU correctness, configuration, profiling, and summary tests:
+#### A100 controlled A/B
+
+The verl v0.9.0 adaptation was exercised on one node with 8 NVIDIA A100 GPUs
+using Qwen3-8B BF16, THD/remove-padding, TP=2, PP=2, CP=2, sequence parallelism
+enabled, and rollout TP=4. Actor/ref parameter offload was enabled. Each
+workload used one prompt with two rollouts per step and ran for four steps. A
+cache-fill run generated the trajectories; both measured arms injected the
+same two cached trajectories at every step. The baseline and optimized arms
+both enabled the same synchronized profiling instrumentation.
+
+Step 1 was treated as warmup. Mean results for steps 2-4 were:
+
+| Workload | Actual prompt | Response | Baseline step | Optimized step | Step reduction | Throughput gain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| balanced | 8046-8052 | 8192 | 47.815 s | 47.249 s | 1.18% | 1.20% |
+| prompt-heavy | 16230-16232 | 4096 | 54.398 s | 50.663 s | **6.86%** | **7.37%** |
+
+The three prompt-heavy steady-step reductions were 7.03%, 6.88%, and 6.68%.
+The measured stage means were:
+
+| Workload | Stage | Baseline | Optimized | Reduction |
+| --- | --- | ---: | ---: | ---: |
+| balanced | actor old-log-prob | 7.201 s | 6.546 s | 9.09% |
+| balanced | ref log-prob | 7.777 s | 7.578 s | 2.56% |
+| balanced | actor update | 19.267 s | 18.815 s | 2.34% |
+| prompt-heavy | actor old-log-prob | 8.605 s | 7.253 s | **15.71%** |
+| prompt-heavy | ref log-prob | 9.008 s | 8.421 s | **6.52%** |
+| prompt-heavy | actor update | 22.918 s | 21.501 s | **6.18%** |
+
+`actor old-log-prob` requests entropy in the v1 trainer. The measured actor
+update did not request entropy because both `actor.calculate_entropy` and
+`actor.entropy_coeff` were zero. The local profiler covers the forward LM-head
+and vocabulary processing region; actor-update stage time above also includes
+the subsequent backward and optimizer-facing work.
+
+#### Final-pipeline-stage LM-head measurements
+
+TP partitions vocabulary columns and CP partitions token rows. For a fixed DP
+replica and final PP stage, summing local logits elements over all TP x CP ranks
+therefore reconstructs the logical global `[tokens, vocabulary]` matrix. This
+is an aggregate work/temporary-storage metric, not memory resident on one GPU.
+Per-GPU feasibility and distributed critical-path latency are instead bounded
+by the response-bearing final-stage rank.
+
+The balanced workload had a global active-row ratio of about 50.44%, implying
+about 49.56% fewer aggregate logits elements. On the observed response-bearing
+rank, post-warmup medians were:
+
+| Pass | Baseline latency | Optimized latency | Reduction | Baseline peak increment | Optimized peak increment |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| actor, no entropy | 180.80 ms | 112.79 ms | 37.61% | 6.894 GiB | 3.444 GiB |
+| actor, entropy | 513.11 ms | 183.98 ms | 64.14% | 13.850 GiB | 6.827 GiB |
+| ref, no entropy | 155.15 ms | 92.86 ms | 40.15% | 6.832 GiB | 3.382 GiB |
+
+The prompt-heavy workload had a global active-row ratio of about 20.15%, so
+the logical TP x CP aggregate contains about 79.85% fewer logits elements.
+With CP=2, response rows were concentrated on one CP shard; its local active
+ratio was 40.30%, while the other observed CP shard had no active rows. On the
+observed response-bearing rank:
+
+| Pass | Baseline latency | Optimized latency | Reduction | Baseline peak increment | Optimized peak increment |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| actor, no entropy | 217.92 ms | 120.59 ms | **44.66%** | 8.629 GiB | 3.462 GiB |
+| actor, entropy | 635.70 ms | 165.71 ms | **73.93%** | 17.337 GiB | 6.878 GiB |
+| ref, no entropy | 206.73 ms | 99.05 ms | **52.09%** | 8.552 GiB | 3.400 GiB |
+
+This is approximately a 60% reduction in the measured LM-head peak increment
+on the response-bearing rank. Empty CP ranks projected only the required dummy
+row and completed forward/backward collectives without a hang.
+
+Ray forwarded records for only three of the expected four final-stage ranks.
+The tables above therefore use the observed response-bearing rank; the global
+logits reductions come from exact token/vocabulary geometry, not an incomplete
+sum of driver-forwarded records. Cross-rank p50 results that were dominated by
+the two empty-rank streams (and suggested 94-99% latency reductions) are
+intentionally not reported. A production-quality summary must fail on missing
+ranks, report the maximum per-rank median for latency/peak memory, and sum
+actual/dense logits bytes over the complete final-stage rank set.
+
+#### Correctness evidence and limitation
+
+Baseline and optimized runs injected identical cached trajectories. Prompt and
+response lengths, actor entropy, rollout-correlation metrics, rewards, and
+loss metrics matched step by step. The runs provide real TP=2, SP=true, CP=2,
+PP=2 coverage, including CP-local empty masks and NCCL forward/backward
+collective liveness.
+
+The synthetic NIAH reward saturated: all two-rollout groups received reward 1,
+so GRPO advantages, actor loss, and gradient norm were zero. These runs
+therefore validate selected-token forward outputs and distributed liveness,
+but do not establish non-zero-gradient multi-GPU backward parity. That remains
+a submission gate and should be covered with a non-saturated reward workload
+or a non-zero entropy coefficient using the same cached-token A/B procedure.
+
+Because profiling synchronizes the accelerator and resets peak-memory stats,
+the end-to-end numbers above are controlled engineering evidence rather than
+production timing. A profiler-disabled, repeated/reversed-order A/B is
+recommended before making a statistically rigorous throughput claim.
+
+#### Functional-patch CPU tests
+
+The tests shipped in the functional patch were run with:
 
 ```bash
 python -m pytest -q \
   tests/models/mcore/test_response_only_lm_head_on_cpu.py \
-  tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py \
   tests/workers/test_megatron_distillation_only_on_cpu.py \
   tests/workers/config/test_engine_config_on_cpu.py
 ```
 
-Result: `26 passed`.
+Result: `24 passed`.
 
 Coverage includes:
 
@@ -131,13 +231,22 @@ Coverage includes:
 - sparse input selection and output-layout restoration, including non-empty
   backward scatter;
 - fused-forward initialization behavior;
-- configuration defaults;
-- profiler dense/sparse byte accounting and JSON output;
-- per-rank warmup, aggregation, latency, and memory comparison logic, including
-  rejection of mismatched dense workloads.
+- configuration defaults.
 
-The merged core/profiler test file follows the repository's `*_on_cpu.py`
-convention, so these tests are collected by the standard CPU CI job.
+The feature test file follows the repository's `*_on_cpu.py` convention, so it
+is collected by the standard CPU CI job.
+
+The local-only profiling patch has a separate summary test:
+
+```bash
+python -m pytest -q \
+  tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
+```
+
+Result: `2 passed`. It covers dense/sparse byte accounting, JSON parsing,
+per-rank warmup, latency/memory comparisons, and rejection of mismatched dense
+workloads. This test and its profiling implementation are not part of the
+functional PR.
 
 Additional checks completed:
 
@@ -148,10 +257,6 @@ Additional checks completed:
 | Generated Megatron trainer configuration | PASS |
 | `git diff --check` | PASS |
 | docs-time, docstrings, license, device API, DataProto, compileall | PASS |
-
-Real TP/SP/CP accelerator validation is still required before requesting
-upstream review. CPU tests mock the SP collective boundary and cannot validate
-NCCL/HCCL behavior or production kernel timing.
 
 ### Performance validation patch
 
@@ -186,12 +291,19 @@ Summarize captured logs with:
 python examples/profile/summarize_response_only_lm_head.py \
   --baseline baseline.log \
   --optimized response_only.log \
-  --warmup 2
+  --warmup 1
 ```
 
 The profiler synchronizes the accelerator and resets peak-memory statistics at
 the LM-head boundary. Both A/B arms must use it, and results should not be mixed
 with production step timing or process-wide peak-memory metrics.
+
+For the four-step smoke test, `--warmup 1` leaves three samples per recurring
+rank/pass stream. Before accepting an aggregate, verify that every expected
+final-stage rank is present. Do not interpret a median across CP ranks as the
+distributed critical path: report per-rank medians first, take the maximum for
+latency and peak memory, and sum actual/dense logits bytes only over a complete
+TP x CP rank set.
 
 Recommended hardware matrix:
 
@@ -205,9 +317,9 @@ Recommended hardware matrix:
 
 Report per-rank maximum latency, LM-head median/p95 latency, optimizer-step
 time, actual/dense logits GiB, incremental LM-head peak, and whole-process peak.
-No Megatron accelerator numbers are claimed in this document until that A/B is
-run. FSDP measurements in #7370 are useful as an order-of-magnitude reference
-but are not evidence for this backend.
+The A100 measurements above cover one real TP+SP+CP+PP topology. Additional
+active ratios, BSHD, non-zero-gradient backward parity, and longer
+profiler-disabled timing runs remain useful follow-ups.
 
 ### API and usage
 
@@ -247,13 +359,19 @@ Separate profiling patch:
 ### Checklist Before Submitting
 
 - [x] Read the contribution guide and repository `AGENTS.md`.
-- [x] Checked for materially overlapping open PRs.
+- [x] Searched GitHub and current upstream source for materially overlapping
+  work as of 2026-08-31.
+- [ ] Re-run the repository-mandated duplicate checks with `gh` immediately
+  before opening the PR; GitHub CLI was unavailable on the analysis host.
 - [x] Added focused CPU tests and documentation.
-- [ ] Run real multi-accelerator TP/SP/CP parity and A/B measurements.
+- [x] Run real A100 TP=2/SP/CP=2/PP=2 A/B and CP-empty-rank liveness.
+- [ ] Run real multi-accelerator non-zero-gradient backward parity.
+- [ ] Repeat profiler-disabled timing in reversed A/B order if claiming
+  statistically rigorous production throughput.
 - [ ] Run full pre-commit in an environment that can fetch its remote hook
   environments. Local equivalents have passed.
-- [ ] Rebase onto the requested upstream target if it has advanced beyond
-  v0.9.0.
+- [ ] Rebase the functional commit onto current `upstream/main` and re-run
+  tests; the validation branch is based on verl v0.9.0.
 - [ ] Request CI through the verl Slack/Feishu process when ready.
 - [x] Recipe-submodule update is not applicable.
 
