@@ -66,7 +66,7 @@ Sparse labels and temperatures are selected in the same order as hidden rows. Af
 
 #### A100 controlled A/B
 
-The verl v0.9.0 adaptation was exercised on one node with 8 NVIDIA A100 GPUs using Qwen3-8B BF16, THD/remove-padding, TP=2, PP=2, CP=2, sequence parallelism enabled, and rollout TP=4. Actor/ref parameter offload was enabled. Each workload used one prompt with two rollouts per step and ran for four steps. A cache-fill run generated the trajectories; both measured arms injected the same two cached trajectories at every step.
+The verl v0.9.0 adaptation was exercised on one node with 8 NVIDIA A100 GPUs using Qwen3-8B BF16, THD/remove-padding, TP=2, PP=2, CP=2, sequence parallelism enabled, and rollout TP=4. Actor/ref parameter offload was enabled. Each workload used one prompt with two rollouts per step and ran for four steps. A cache-fill run generated the trajectories; both measured arms injected the same two cached trajectories at every step and used identical synchronized measurement instrumentation.
 
 Step 1 was treated as warmup. Mean results for steps 2-4 were:
 
@@ -87,6 +87,25 @@ The three prompt-heavy steady-step reductions were 7.03%, 6.88%, and 6.68%. The 
 | prompt-heavy | actor update | 22.918 s | 21.501 s | **6.18%** |
 
 `actor old-log-prob` requests entropy in the v1 trainer. The measured actor update did not request entropy because both `actor.calculate_entropy` and `actor.entropy_coeff` were zero. Actor-update stage time also includes backward and optimizer-facing work.
+
+#### LM-head latency and memory measurements
+
+TP partitions vocabulary columns and CP partitions token rows. The following post-warmup medians were measured on the observed response-bearing final-pipeline-stage rank. Incremental peak memory is the peak allocated memory during LM-head and vocabulary processing minus the allocation immediately before that region; it is not whole-process or whole-device peak memory.
+
+| Workload | Pass | Baseline latency | Optimized latency | Reduction | Baseline incremental peak | Optimized incremental peak | Memory reduction |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| balanced | actor, no entropy | 180.80 ms | 112.79 ms | 37.61% | 6.894 GiB | 3.444 GiB | 50.04% |
+| balanced | actor, entropy | 513.11 ms | 183.98 ms | 64.14% | 13.850 GiB | 6.827 GiB | 50.71% |
+| balanced | ref, no entropy | 155.15 ms | 92.86 ms | 40.15% | 6.832 GiB | 3.382 GiB | 50.50% |
+| prompt-heavy | actor, no entropy | 217.92 ms | 120.59 ms | **44.66%** | 8.629 GiB | 3.462 GiB | **59.88%** |
+| prompt-heavy | actor, entropy | 635.70 ms | 165.71 ms | **73.93%** | 17.337 GiB | 6.878 GiB | **60.33%** |
+| prompt-heavy | ref, no entropy | 206.73 ms | 99.05 ms | **52.09%** | 8.552 GiB | 3.400 GiB | **60.24%** |
+
+The balanced workload had a global active-row ratio of about 50.44%, consistent with the approximately 50% reduction in LM-head incremental peak memory. The prompt-heavy workload had a global active-row ratio of about 20.15%; with CP=2, response rows were concentrated on one CP shard, giving the response-bearing rank a 40.30% local active-row ratio and approximately 60% lower incremental peak memory. The other observed CP shard had no active rows and projected only the required dummy row without hanging during forward or backward collectives.
+
+Ray forwarded records for three of the expected four final-stage ranks. The per-rank measurements above therefore report the observed response-bearing rank rather than an incomplete cross-rank aggregate. The global active-row ratios come from exact token/vocabulary geometry, but these measurements do not claim a complete maximum across all final-stage ranks or a reduction in whole-process peak memory.
+
+The synchronized instrumentation resets peak-memory statistics at the LM-head boundary. Consequently, the short end-to-end timings above are controlled engineering evidence rather than statistically rigorous production throughput measurements; a longer repeated and reversed-order A/B without synchronization is still recommended for a production throughput claim.
 
 #### Correctness evidence and limitation
 
