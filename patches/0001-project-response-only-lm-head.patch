@@ -1,70 +1,30 @@
-From c0cd2ad76263151cfc5ac626edc971920bd016a1 Mon Sep 17 00:00:00 2001
+From baa8477ea6aba1a30af244d19cdfe64c7187593f Mon Sep 17 00:00:00 2001
 From: qiangyupei <492261796@qq.com>
-Date: Wed, 19 Aug 2026 12:03:55 +0800
+Date: Wed, 9 Sep 2026 11:14:28 +0800
 Subject: [PATCH 1/2] [megatron] feat: project LM head only for response tokens
 
-Select next-token-aligned loss-mask rows before the vocabulary projection, then restore scalar token outputs to the regular layout. Preserve tensor/sequence/context-parallel semantics and fail closed for unsupported fused, MTP, and top-k paths.
+Select loss-bearing predictor rows before unfused vocabulary projection or fused linear log-probability and entropy computation. Preserve TP, SP, CP, and PP semantics and restore scalar outputs to the existing token layout.
 
 Assisted-by: OpenAI Codex
 ---
- docs/perf/perf_tuning.rst                     |  23 ++-
- .../test_response_only_lm_head_on_cpu.py      | 184 ++++++++++++++++++
- .../config/test_engine_config_on_cpu.py       |   1 +
- .../test_megatron_distillation_only_on_cpu.py |  55 ++++++
- verl/models/mcore/model_forward.py            |  86 ++++++--
- verl/models/mcore/response_only_lm_head.py    | 149 ++++++++++++++
+ .../test_response_only_lm_head_on_cpu.py      | 170 ++++++++++++++++++
+ verl/models/mcore/model_forward.py            |  89 ++++++---
+ verl/models/mcore/model_forward_fused.py      |  85 +++++++--
+ verl/models/mcore/response_only_lm_head.py    | 153 ++++++++++++++++
  .../_generated_ppo_megatron_trainer.yaml      |   3 +
  verl/trainer/config/engine/megatron.yaml      |   4 +
  verl/workers/config/engine.py                 |   3 +
- .../engine/megatron/transformer_impl.py       |  30 ++-
- 10 files changed, 520 insertions(+), 18 deletions(-)
+ .../engine/megatron/transformer_impl.py       |  28 ++-
+ 8 files changed, 494 insertions(+), 41 deletions(-)
  create mode 100644 tests/models/mcore/test_response_only_lm_head_on_cpu.py
  create mode 100644 verl/models/mcore/response_only_lm_head.py
 
-diff --git a/docs/perf/perf_tuning.rst b/docs/perf/perf_tuning.rst
-index ed6c407c..374d901d 100644
---- a/docs/perf/perf_tuning.rst
-+++ b/docs/perf/perf_tuning.rst
-@@ -1,7 +1,7 @@
- Performance Tuning Guide
- ==============================
- 
--Last updated: 07/17/2025.
-+Last updated: 08/19/2026.
- 
- Author: `Guangming Sheng <https://github.com/PeterSH6>`_, `Jiali Zheng <https://github.com/CurryRice233>`_
- 
-@@ -246,3 +246,24 @@ This processes the tensor in chunks of shape ``[chunk_size, voc]`` (e.g., 2048)
- Additionally, during training, standard gradient checkpointing (``enable_gradient_checkpointing=True``) does not apply to entropy calculations. To reduce memory peaks in this context, set:
- ``actor_rollout_ref.actor.entropy_checkpointing = True``
- This enables entropy recomputation specifically for the entropy calculation, lowering memory usage during training.
-+
-+Project only loss-bearing rows in the Megatron LM head
-+-------------------------------------------------------
-+
-+Agent trajectories can contain long prompts and environment or tool-output
-+spans that do not contribute to the policy loss. The unfused Megatron path can
-+skip the vocabulary projection for those rows by enabling::
-+
-+    actor_rollout_ref.actor.megatron.response_only_lm_head = True
-+    actor_rollout_ref.ref.megatron.response_only_lm_head = True
-+
-+The optimization applies the causal shift to ``loss_mask``, selects the
-+corresponding hidden-state rows before the LM head, and restores token-level
-+log-probability and entropy outputs to their original layout with zeros at
-+unselected positions. It supports THD and BSHD inputs together with tensor,
-+sequence, context, and pipeline parallelism.
-+
-+The expected LM-head logits reduction is proportional to the active-row ratio
-+``loss_mask.sum() / input_tokens``. This option uses the unfused forward path
-+and currently does not support MTP training or top-k distillation. It is most
-+useful when the active-row ratio is low and the vocabulary is large.
 diff --git a/tests/models/mcore/test_response_only_lm_head_on_cpu.py b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
 new file mode 100644
-index 00000000..a5cc3ec3
+index 00000000..8aacd3f5
 --- /dev/null
 +++ b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,170 @@
 +# Copyright 2026 Bytedance Ltd. and/or its affiliates
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,35 +44,27 @@ index 00000000..a5cc3ec3
 +import pytest
 +import torch
 +
++from verl.models.mcore import model_forward_fused as mff
 +from verl.models.mcore.model_forward import _build_full_loss_mask_nested
 +from verl.models.mcore.response_only_lm_head import (
 +    response_only_output_projection,
 +    restore_response_only_outputs,
 +    select_response_only_inputs,
 +)
-+from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
++from verl.models.mcore.util import preprocess_thd_engine
 +
 +
-+class _FakeOutputLayer(torch.nn.Module):
-+    def __init__(self, *, sequence_parallel=True, supports_disable_grad_reduce=True):
++class _OutputLayer(torch.nn.Module):
++    def __init__(self, hidden_size=None, vocab_size=None, *, sequence_parallel=False):
 +        super().__init__()
 +        self.sequence_parallel = sequence_parallel
-+        if supports_disable_grad_reduce:
-+            self.disable_grad_reduce = False
++        self.disable_grad_reduce = False
 +        self.tp_group = object()
++        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size)) if hidden_size is not None else None
 +
 +    def forward(self, input_):
-+        return input_, None
-+
-+
-+class _FakeLinearOutputLayer(torch.nn.Module):
-+    def __init__(self, hidden_size, vocab_size):
-+        super().__init__()
-+        self.sequence_parallel = False
-+        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size))
-+
-+    def forward(self, input_):
-+        return torch.nn.functional.linear(input_, self.weight), None
++        output = input_ if self.weight is None else torch.nn.functional.linear(input_, self.weight)
++        return output, None
 +
 +
 +class _Model(torch.nn.Module):
@@ -125,218 +77,138 @@ index 00000000..a5cc3ec3
 +        return logits.transpose(0, 1).contiguous()
 +
 +
-+@pytest.mark.parametrize("data_format", ["thd", "bshd"])
-+def test_response_mask_is_next_token_aligned_with_internal_tool_spans(data_format):
-+    padded_response_mask = torch.tensor(
-+        [
-+            [1, 1, 0, 1, 0],
-+            [1, 0, 1, 1, 0],
-+        ],
-+        dtype=torch.bool,
++def test_response_mask_is_next_token_aligned():
++    response_mask = torch.nested.as_nested_tensor(
++        [torch.tensor([1, 1, 0, 1, 0]), torch.tensor([1, 0, 1, 1])], layout=torch.jagged
 +    )
-+    response_attention_mask = torch.tensor(
-+        [
-+            [1, 1, 1, 1, 1],
-+            [1, 1, 1, 1, 0],
-+        ],
-+        dtype=torch.bool,
-+    )
-+    if data_format == "thd":
-+        response_mask = torch.nested.as_nested_tensor(
-+            [padded_response_mask[0], padded_response_mask[1, :4]], layout=torch.jagged
-+        )
-+        response_attention_mask = None
-+        preprocess = preprocess_thd_engine
-+    else:
-+        response_mask = padded_response_mask
-+        preprocess = preprocess_bshd_engine
-+    full_mask = _build_full_loss_mask_nested(response_mask, [8, 8], response_attention_mask)
++    full_mask = _build_full_loss_mask_nested(response_mask, [8, 8], None)
 +
 +    with (
 +        patch("verl.models.mcore.util.mpu.get_context_parallel_world_size", return_value=1),
 +        patch("verl.models.mcore.util.mpu.get_context_parallel_rank", return_value=0),
 +        patch("verl.models.mcore.util.mpu.get_tensor_model_parallel_world_size", return_value=1),
 +    ):
-+        projection_mask = preprocess(full_mask, need_roll=True)[0]
++        projection_mask = preprocess_thd_engine(full_mask, need_roll=True)[0]
 +
-+    expected = torch.tensor(
-+        [
-+            [0, 0, 1, 1, 0, 1, 0, 0],
-+            [0, 0, 0, 1, 0, 1, 1, 0],
-+        ],
-+        dtype=torch.bool,
-+    )
-+    if data_format == "thd":
-+        expected = expected.reshape(1, -1)
++    expected = torch.tensor([[0, 0, 1, 1, 0, 1, 0, 0], [0, 0, 0, 1, 0, 1, 1, 0]], dtype=torch.bool).reshape(1, -1)
 +    torch.testing.assert_close(projection_mask, expected)
 +
 +
-+def test_projection_hook_gathers_tp_sequence_before_selecting_hidden_states():
-+    output_layer = _FakeOutputLayer()
++@pytest.mark.parametrize("empty", [False, True])
++def test_unfused_projection_preserves_values_and_gradients(empty):
++    torch.manual_seed(7)
++    mask = torch.tensor([[False, True, True, False], [True, False, True, False]])
++    if empty:
++        mask.zero_()
++
++    dense_layer = _OutputLayer(3, 5)
++    sparse_layer = _OutputLayer(3, 5)
++    sparse_layer.load_state_dict(dense_layer.state_dict())
++    dense_model, sparse_model = _Model(dense_layer), _Model(sparse_layer)
++    dense_hidden = torch.randn(4, 2, 3, requires_grad=True)
++    sparse_hidden = dense_hidden.detach().clone().requires_grad_()
++
++    dense_logits = dense_model(dense_hidden)
++    dense_logits[mask].square().sum().backward()
++
++    with response_only_output_projection(sparse_model, mask):
++        sparse_logits = sparse_model(sparse_hidden)
++    labels = torch.arange(mask.numel()).reshape_as(mask)
++    sparse_labels, _, num_selected = select_response_only_inputs(labels, torch.ones_like(labels), mask)
++    restored = restore_response_only_outputs({"values": sparse_logits.square().sum(-1)}, mask, num_selected)["values"]
++    restored.sum().backward()
++
++    assert num_selected == int(mask.sum())
++    if num_selected:
++        torch.testing.assert_close(sparse_logits[0], dense_logits[mask])
++        torch.testing.assert_close(sparse_labels[0], labels[mask])
++    torch.testing.assert_close(sparse_hidden.grad, dense_hidden.grad)
++    torch.testing.assert_close(sparse_layer.weight.grad, dense_layer.weight.grad)
++
++
++def test_unfused_sequence_parallel_gathers_before_selection():
++    output_layer = _OutputLayer(sequence_parallel=True)
 +    model = _Model(output_layer)
 +    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
-+    gathered = torch.cat((hidden, hidden + 10), dim=0)
-+    projection_mask = torch.tensor([[False, True, True, False]])
++    gathered = torch.cat((hidden, hidden + 10))
++    mask = torch.tensor([[False, True, True, False]])
 +
 +    with (
 +        patch(
 +            "megatron.core.tensor_parallel.gather_from_sequence_parallel_region",
 +            return_value=gathered,
 +        ) as gather,
-+        response_only_output_projection(model, projection_mask),
++        response_only_output_projection(model, mask),
 +    ):
-+        projected, _ = output_layer(hidden)
-+        assert output_layer.sequence_parallel is False
-+        assert output_layer.disable_grad_reduce is True
++        selected, _ = output_layer(hidden)
++        assert not output_layer.sequence_parallel
++        assert output_layer.disable_grad_reduce
 +
 +    gather.assert_called_once_with(hidden, tensor_parallel_output_grad=True, group=output_layer.tp_group)
-+    expected = torch.stack((gathered[1, 0], gathered[2, 0])).reshape(2, 1, 2)
-+    torch.testing.assert_close(projected, expected)
-+    assert output_layer.sequence_parallel is True
-+    assert output_layer.disable_grad_reduce is False
++    torch.testing.assert_close(selected[:, 0], gathered[[1, 2], 0])
++    assert output_layer.sequence_parallel
++    assert not output_layer.disable_grad_reduce
 +
 +
-+def test_projection_hook_preserves_active_logits_and_gradients_without_sequence_parallelism():
-+    torch.manual_seed(7)
-+    projection_mask = torch.tensor([[False, True, True, False], [True, False, True, False]])
-+    dense_layer = _FakeLinearOutputLayer(hidden_size=3, vocab_size=5)
-+    sparse_layer = _FakeLinearOutputLayer(hidden_size=3, vocab_size=5)
-+    dense_model = _Model(dense_layer)
-+    sparse_model = _Model(sparse_layer)
-+    sparse_layer.load_state_dict(dense_layer.state_dict())
-+    dense_hidden = torch.randn(4, 2, 3, requires_grad=True)
-+    sparse_hidden = dense_hidden.detach().clone().requires_grad_()
++@pytest.mark.parametrize("sequence_parallel", [False, True])
++def test_fused_projection_matches_dense_values_and_gradients(sequence_parallel):
++    torch.manual_seed(42)
++    mask = torch.tensor([[False, True, False, True, True, False]])
++    labels = torch.tensor([[0, 1, 2, 3, 4, 0]])
++    initial_hidden = torch.randn(6, 1, 3)
++    initial_weight = torch.randn(5, 3)
++    coefficients = torch.randn(1, 6) * mask
 +
-+    dense_active = dense_model(dense_hidden)[projection_mask]
-+    dense_active.square().sum().backward()
++    def run(projection_mask):
++        hidden = initial_hidden.clone().requires_grad_()
++        weight = initial_weight.clone().requires_grad_()
++        projected_rows = []
 +
-+    with response_only_output_projection(sparse_model, projection_mask):
-+        sparse_logits = sparse_model(sparse_hidden)
-+    sparse_logits.square().sum().backward()
++        def kernel(h, w, y, temperature, reduction, group):
++            projected_rows.append(h.shape[0])
++            log_probs = (h.reshape(-1, 3) @ w.T / temperature).log_softmax(-1)
++            return log_probs.gather(-1, y.reshape(-1, 1)).squeeze(-1), -(log_probs.exp() * log_probs).sum(-1)
 +
-+    torch.testing.assert_close(sparse_logits[0], dense_active)
-+    torch.testing.assert_close(sparse_hidden.grad, dense_hidden.grad)
-+    torch.testing.assert_close(sparse_layer.weight.grad, dense_layer.weight.grad)
++        with (
++            patch.object(mff, "linear_cross_entropy", side_effect=kernel),
++            patch.object(mff.parallel_state, "get_tensor_model_parallel_group", return_value=object()),
++            patch.object(mff, "gather_from_sequence_parallel_region", side_effect=lambda value: value) as gather,
++            patch.object(mff, "copy_to_tensor_model_parallel_region", side_effect=lambda value, group: value) as copy,
++        ):
++            log_probs, entropy = mff._compute_fused_lm_head(
++                hidden, weight, labels, 0.7, sequence_parallel, projection_mask
++            )
 +
++        assert gather.called == sequence_parallel
++        assert copy.called != sequence_parallel
++        log_probs, entropy = log_probs.reshape_as(mask), entropy.reshape_as(mask)
++        ((log_probs + 0.1 * entropy) * coefficients).sum().backward()
++        return log_probs, entropy, hidden.grad, weight.grad, projected_rows
 +
-+def test_sequence_parallel_output_layer_must_support_disabling_grad_reduction():
-+    model = _Model(_FakeOutputLayer(supports_disable_grad_reduce=False))
-+    with (
-+        pytest.raises(RuntimeError, match="disable_grad_reduce"),
-+        response_only_output_projection(model, torch.ones(1, 2, dtype=torch.bool)),
-+    ):
-+        pass
-+
-+
-+def test_empty_local_response_mask_keeps_a_zero_gradient_path():
-+    projection_mask = torch.zeros(1, 4, dtype=torch.bool)
-+    model = _Model(_FakeLinearOutputLayer(hidden_size=3, vocab_size=5))
-+    hidden = torch.randn(4, 1, 3, requires_grad=True)
-+    with response_only_output_projection(model, projection_mask):
-+        logits = model(hidden)
-+
-+    sparse_label, _, num_selected = select_response_only_inputs(
-+        torch.arange(4).reshape(1, 4), torch.ones(1, 4), projection_mask
-+    )
-+    assert num_selected == 0
-+    torch.testing.assert_close(sparse_label, torch.zeros(1, 1, dtype=torch.long))
-+
-+    sparse_output = logits.sum(dim=-1)
-+    restored = restore_response_only_outputs({"log_probs": sparse_output}, projection_mask, num_selected)["log_probs"]
-+    restored.sum().backward()
-+
-+    torch.testing.assert_close(restored, torch.zeros_like(restored))
-+    assert hidden.grad is not None and model.output_layer.weight.grad is not None
-+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden.grad))
-+    torch.testing.assert_close(model.output_layer.weight.grad, torch.zeros_like(model.output_layer.weight.grad))
-diff --git a/tests/workers/config/test_engine_config_on_cpu.py b/tests/workers/config/test_engine_config_on_cpu.py
-index 1253f5c9..0ad8eaa8 100644
---- a/tests/workers/config/test_engine_config_on_cpu.py
-+++ b/tests/workers/config/test_engine_config_on_cpu.py
-@@ -22,6 +22,7 @@ class TestMcoreEngineConfig:
-         config = McoreEngineConfig()
-         assert config.tensor_model_parallel_size == 1
-         assert config.sequence_parallel is False  # Should be auto-corrected
-+        assert config.response_only_lm_head is False
-         assert config.seed == 42
- 
-     def test_post_init_validation(self):
-diff --git a/tests/workers/test_megatron_distillation_only_on_cpu.py b/tests/workers/test_megatron_distillation_only_on_cpu.py
-index 3e399442..3bb51003 100644
---- a/tests/workers/test_megatron_distillation_only_on_cpu.py
-+++ b/tests/workers/test_megatron_distillation_only_on_cpu.py
-@@ -115,3 +115,58 @@ def test_megatron_logits_processor_without_topk_always_computes_log_probs():
-     assert "log_probs" in ret
-     for k in _DISTILLATION_KEYS:
-         assert k not in ret
-+
-+
-+def test_megatron_logits_processor_restores_response_only_outputs():
-+    eng = _make_engine_stub()
-+    projection_mask = torch.tensor(
-+        [
-+            [False, True, False, True],
-+            [True, False, True, False],
-+        ]
-+    )
-+    label = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]])
-+    temperature = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
-+    logits_leaf = torch.ones(1, 4, _VOCAB_SIZE, requires_grad=True)
-+
-+    def log_probs(logits, selected_label):
-+        torch.testing.assert_close(selected_label, torch.tensor([[1, 3, 4, 6]]))
-+        return logits[..., 0]
-+
-+    with patch(
-+        "verl.workers.engine.megatron.transformer_impl.vocab_parallel_log_probs_from_logits",
-+        side_effect=log_probs,
-+    ):
-+        ret = eng._lm_head_logits_processor(
-+            logits_leaf + 0,
-+            label,
-+            temperature,
-+            calculate_sum_pi_squared=False,
-+            calculate_entropy=False,
-+            distillation_use_topk=False,
-+            distillation_only=False,
-+            logits_processor_func=_make_logits_processor(_DISTILLATION_KEYS),
-+            batch=TensorDict({}, batch_size=[]),
-+            data_format="bshd",
-+            projection_mask=projection_mask,
-+        )
-+
-+    expected = torch.zeros(2, 4)
-+    expected[projection_mask] = 1 / temperature[projection_mask]
-+    torch.testing.assert_close(ret["log_probs"], expected)
-+
-+    weights = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
-+    (ret["log_probs"] * weights).sum().backward()
-+    expected_grad = torch.zeros_like(logits_leaf)
-+    expected_grad[0, :, 0] = weights[projection_mask] / temperature[projection_mask]
-+    torch.testing.assert_close(logits_leaf.grad, expected_grad)
-+
-+
-+def test_response_only_lm_head_disables_fused_forward_before_model_patch():
-+    eng = object.__new__(MegatronEngineWithLMHead)
-+    eng.engine_config = SimpleNamespace(use_fused_kernels=True, response_only_lm_head=True)
-+
-+    with patch("verl.workers.engine.megatron.transformer_impl.logger.warning_once", create=True):
-+        eng._maybe_enable_fused_kernels()
-+
-+    assert eng.engine_config.use_fused_kernels is False
++    sparse = run(mask)
++    dense = run(None)
++    torch.testing.assert_close(sparse[0][mask], dense[0][mask])
++    torch.testing.assert_close(sparse[1][mask], dense[1][mask])
++    torch.testing.assert_close(sparse[2], dense[2])
++    torch.testing.assert_close(sparse[3], dense[3])
++    assert sparse[4] == [int(mask.sum())]
++    assert dense[4] == [mask.numel()]
++    assert torch.count_nonzero(sparse[0][~mask]) == 0
++    assert torch.count_nonzero(sparse[1][~mask]) == 0
 diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
-index 6d2a6b29..cedabfb3 100644
+index 6d2a6b29..bfaf6983 100644
 --- a/verl/models/mcore/model_forward.py
 +++ b/verl/models/mcore/model_forward.py
-@@ -13,6 +13,7 @@
+@@ -13,7 +13,7 @@
  # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  # See the License for the specific language governing permissions and
  # limitations under the License.
+-from typing import Optional
 +from contextlib import nullcontext
- from typing import Optional
  
  import torch
-@@ -21,6 +22,7 @@ from torch.nested._internal.nested_tensor import NestedTensor
+ from torch.nested._internal.nested_tensor import NestedTensor
+@@ -21,6 +21,7 @@ from torch.nested._internal.nested_tensor import NestedTensor
  from verl.utils.megatron_utils import unwrap_model
  from verl.workers.config import MtpConfig
  
@@ -344,7 +216,7 @@ index 6d2a6b29..cedabfb3 100644
  from .util import (
      build_vlm_attn_mask_bshd,
      build_vlm_attn_mask_thd,
-@@ -210,8 +212,8 @@ def _convert_to_nested_tensor(v, input_ids_lengths):
+@@ -210,8 +211,8 @@ def _convert_to_nested_tensor(v, input_ids_lengths):
      return v
  
  
@@ -355,7 +227,7 @@ index 6d2a6b29..cedabfb3 100644
  
      ``response_mask`` is response-only data. This expands it to full packed
      input length as prompt zeros followed by valid response positions.
-@@ -222,7 +224,7 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
+@@ -222,7 +223,7 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
          batch_size = len(response_lengths)
          response_values = response_mask.values()
      else:
@@ -364,30 +236,34 @@ index 6d2a6b29..cedabfb3 100644
          assert not isinstance(response_attention_mask, NestedTensor), (
              "response_attention_mask must be a padded (bs, max_response_len) tensor, got NestedTensor"
          )
-@@ -272,6 +274,7 @@ def gptmodel_forward_model_engine(
+@@ -272,9 +273,10 @@ def gptmodel_forward_model_engine(
      pad_token_id=None,
      data_format: str = "thd",
      mtp_enable_train: bool = False,
+-    local_cp_size: Optional[int] = None,
+-    forced_max_seqlen: Optional[int] = None,
+-    pad_to_length_bucket: Optional[int] = None,
 +    response_only_lm_head: bool = False,
-     local_cp_size: Optional[int] = None,
-     forced_max_seqlen: Optional[int] = None,
-     pad_to_length_bucket: Optional[int] = None,
-@@ -284,6 +287,7 @@ def gptmodel_forward_model_engine(
++    local_cp_size: int | None = None,
++    forced_max_seqlen: int | None = None,
++    pad_to_length_bucket: int | None = None,
+     cp_layout: str = "zigzag",
+     router_padding_mask: torch.Tensor | None = None,
+     mtp_loss_normalization_factor: float | None = None,
+@@ -284,7 +286,6 @@ def gptmodel_forward_model_engine(
      assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
      pre_process = unwrap_model(model).pre_process
      post_process = unwrap_model(model).post_process
-+    logits_processor_args = dict(logits_processor_args or {})
- 
+-
      fp8 = unwrap_model(model).config.fp8
      use_fp8_padding = fp8 in ["e4m3", "hybrid"]
-@@ -312,6 +316,26 @@ def gptmodel_forward_model_engine(
+ 
+@@ -312,6 +313,24 @@ def gptmodel_forward_model_engine(
              packed_seq_params._verl_mtp_loss_normalization_factor = mtp_loss_normalization_factor
          input_ids_rmpad = input_ids_rmpad.contiguous()
  
 +        projection_mask = None
 +        if response_only_lm_head and post_process and logits_processor is not None:
-+            if mtp_enable_train:
-+                raise NotImplementedError("response_only_lm_head does not support MTP training")
 +            input_ids_lengths = input_ids.offsets().diff().tolist()
 +            full_loss_mask = _build_full_loss_mask_nested(
 +                logits_processor_args["loss_mask"],
@@ -407,7 +283,7 @@ index 6d2a6b29..cedabfb3 100644
          args = {}
          if mtp_enable_train and post_process:
              # Use input_ids sequence length to ensure label and loss_mask alignment
-@@ -322,7 +346,7 @@ def gptmodel_forward_model_engine(
+@@ -322,7 +341,7 @@ def gptmodel_forward_model_engine(
              for k in ["label", "loss_mask"]:
                  v = logits_processor_args[k]
                  if k == "loss_mask":
@@ -416,7 +292,7 @@ index 6d2a6b29..cedabfb3 100644
                  else:
                      v = _convert_to_nested_tensor(v, input_ids_lengths)
                  logits_processor_args[k] = v
-@@ -352,13 +376,17 @@ def gptmodel_forward_model_engine(
+@@ -352,13 +371,17 @@ def gptmodel_forward_model_engine(
          if router_padding_mask is not None:
              model_kwargs["padding_mask"] = router_padding_mask
  
@@ -440,7 +316,7 @@ index 6d2a6b29..cedabfb3 100644
  
          if post_process and logits_processor is not None:
              args = {
-@@ -373,6 +401,8 @@ def gptmodel_forward_model_engine(
+@@ -373,6 +396,8 @@ def gptmodel_forward_model_engine(
                  )[0]
                  for k, v in logits_processor_args.items()
              }
@@ -449,14 +325,12 @@ index 6d2a6b29..cedabfb3 100644
              output_dict = logits_processor(output_orig, **args)
              output = {
                  k: postprocess_thd_engine(
-@@ -413,6 +443,24 @@ def gptmodel_forward_model_engine(
+@@ -413,6 +438,22 @@ def gptmodel_forward_model_engine(
              forced_max_seqlen=forced_max_seqlen,
          )
  
 +        projection_mask = None
 +        if response_only_lm_head and post_process and logits_processor is not None:
-+            if mtp_enable_train:
-+                raise NotImplementedError("response_only_lm_head does not support MTP training")
 +            input_ids_lengths = input_ids.offsets().diff().tolist()
 +            full_loss_mask = _build_full_loss_mask_nested(
 +                logits_processor_args["loss_mask"],
@@ -474,7 +348,7 @@ index 6d2a6b29..cedabfb3 100644
          if mtp_enable_train and post_process:
              args = {}
              # Use input_ids sequence length to ensure label and loss_mask alignment
-@@ -423,7 +471,7 @@ def gptmodel_forward_model_engine(
+@@ -423,7 +464,7 @@ def gptmodel_forward_model_engine(
              for k in ["label", "loss_mask"]:
                  v = logits_processor_args[k]
                  if k == "loss_mask":
@@ -483,7 +357,7 @@ index 6d2a6b29..cedabfb3 100644
                  else:
                      v = _convert_to_nested_tensor(v, input_ids_lengths)
                  logits_processor_args[k] = v
-@@ -450,12 +498,16 @@ def gptmodel_forward_model_engine(
+@@ -450,12 +491,16 @@ def gptmodel_forward_model_engine(
          else:
              attention_mask = attention_mask_bshd
  
@@ -505,7 +379,7 @@ index 6d2a6b29..cedabfb3 100644
          if post_process and logits_processor is not None:
              args = {
                  k: preprocess_bshd_engine(
-@@ -467,6 +519,8 @@ def gptmodel_forward_model_engine(
+@@ -467,6 +512,8 @@ def gptmodel_forward_model_engine(
                  )[0]
                  for k, v in logits_processor_args.items()
              }
@@ -514,12 +388,196 @@ index 6d2a6b29..cedabfb3 100644
              output_dict = logits_processor(output_orig, **args)
              output = {
                  k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
+diff --git a/verl/models/mcore/model_forward_fused.py b/verl/models/mcore/model_forward_fused.py
+index baf61ced..e9edcdb8 100644
+--- a/verl/models/mcore/model_forward_fused.py
++++ b/verl/models/mcore/model_forward_fused.py
+@@ -17,7 +17,6 @@
+ import inspect
+ from collections import OrderedDict
+ from dataclasses import dataclass
+-from typing import Optional
+ 
+ import megatron.core as mcore
+ import torch
+@@ -26,7 +25,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.models.gpt.gpt_model import GPTModel
+ from megatron.core.packed_seq_params import PackedSeqParams
+-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
++from megatron.core.tensor_parallel.mappings import (
++    copy_to_tensor_model_parallel_region,
++    gather_from_sequence_parallel_region,
++)
+ from megatron.core.utils import deprecate_inference_params
+ from packaging import version
+ from torch import Tensor
+@@ -36,6 +38,8 @@ from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+ from verl.utils.megatron_utils import unwrap_model
+ from verl.utils.model import CausalLMOutputForPPO
+ 
++from .model_forward import _build_full_loss_mask_nested
++from .response_only_lm_head import restore_response_only_outputs, select_response_only_hidden_states
+ from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engine
+ 
+ _FUSED_FORWARD_MODE_ATTR = "_verl_fused_forward_mode"
+@@ -78,6 +82,35 @@ class FusedOutputProcessorContext:
+     """Context passed through Megatron's native output-processor hook."""
+ 
+     temperature: float
++    projection_mask: Tensor | None = None
++
++
++def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_parallel, projection_mask=None):
++    """Run the fused head on all rows or only the loss-bearing predictor rows."""
++    tp_group = parallel_state.get_tensor_model_parallel_group()
++    if sequence_parallel:
++        hidden_states = gather_from_sequence_parallel_region(hidden_states)
++    elif tp_group is not None:
++        # The fused kernel returns a vocabulary-local input gradient. Without
++        # SP's backward reduce-scatter, sum that gradient over TP explicitly.
++        hidden_states = copy_to_tensor_model_parallel_region(hidden_states, group=tp_group)
++
++    if projection_mask is not None:
++        hidden_states = select_response_only_hidden_states(hidden_states, projection_mask)
++        labels = labels[projection_mask]
++        num_selected = labels.numel()
++        if not num_selected:
++            labels = labels.new_zeros(1)
++
++    log_probs, entropy = linear_cross_entropy(hidden_states, weight, labels, temperature, "none", tp_group)
++    if projection_mask is not None:
++        outputs = restore_response_only_outputs(
++            {"log_probs": log_probs.reshape(1, -1), "entropy": entropy.reshape(1, -1)},
++            projection_mask,
++            num_selected,
++        )
++        log_probs, entropy = outputs["log_probs"], outputs["entropy"]
++    return log_probs, entropy
+ 
+ 
+ def fused_output_processor(
+@@ -99,21 +132,18 @@ def fused_output_processor(
+         attentions=None,
+     )
+ 
+-    if config.sequence_parallel:
+-        hidden_states = gather_from_sequence_parallel_region(hidden_states)
+-
+     # Megatron passes the shared embedding as output_weight for tied models. For
+     # untied models the weight lives on output_layer.
+     weight = output_weight if output_weight is not None else output_layer.weight
+ 
+     temperature = context.temperature
+-    logprobs, entropy = linear_cross_entropy(
++    logprobs, entropy = _compute_fused_lm_head(
+         hidden_states,
+         weight,
+         labels,
+         temperature,
+-        "none",
+-        parallel_state.get_tensor_model_parallel_group(),
++        config.sequence_parallel,
++        context.projection_mask,
+     )
+ 
+     if has_config_logger_enabled(config):
+@@ -269,6 +299,8 @@ def fused_forward_model_engine(vision_model: bool = False):
+         local_cp_size: int | None = None,
+         router_padding_mask: Tensor | None = None,
+         pad_to_length_bucket: int | None = None,
++        loss_mask: Tensor | None = None,
++        response_attention_mask: Tensor | None = None,
+     ):
+         pre_process = unwrap_model(model).pre_process
+         post_process = unwrap_model(model).post_process
+@@ -323,6 +355,21 @@ def fused_forward_model_engine(vision_model: bool = False):
+             local_cp_size=local_cp_size,
+         )
+         labels_rmpad = labels_rmpad.contiguous()
++        projection_mask = None
++        if loss_mask is not None and post_process:
++            full_loss_mask = _build_full_loss_mask_nested(
++                loss_mask, input_ids.offsets().diff().tolist(), response_attention_mask
++            )
++            projection_mask = preprocess_thd_engine(
++                full_loss_mask,
++                pre_process=True,
++                need_roll=True,
++                use_fp8_padding=use_fp8_padding,
++                min_local_rows=min_local_rows,
++                pad_to_length_bucket=pad_to_length_bucket,
++                cp_layout=cp_layout,
++                local_cp_size=local_cp_size,
++            )[0].to(torch.bool)
+         forward_kwargs = dict(
+             input_ids=input_ids_rmpad,
+             attention_mask=attention_mask,
+@@ -335,10 +382,12 @@ def fused_forward_model_engine(vision_model: bool = False):
+             output_orig: CausalLMOutputForPPO = model(
+                 **forward_kwargs,
+                 output_processor=fused_output_processor,
+-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
++                output_processor_context=FusedOutputProcessorContext(temperature, projection_mask),
+             )
+         else:
+-            output_orig: CausalLMOutputForPPO = model(temperature=temperature, **forward_kwargs)
++            output_orig: CausalLMOutputForPPO = model(
++                temperature=temperature, projection_mask=projection_mask, **forward_kwargs
++            )
+ 
+         if not post_process:
+             return output_orig
+@@ -388,12 +437,13 @@ def _fused_GPTModel_forward(
+     inference_context: BaseInferenceContext = None,
+     packed_seq_params: PackedSeqParams = None,
+     extra_block_kwargs: dict = None,
+-    runtime_gather_output: Optional[bool] = None,
++    runtime_gather_output: bool | None = None,
+     *,
+-    inference_params: Optional[BaseInferenceContext] = None,
+-    loss_mask: Optional[Tensor] = None,
++    inference_params: BaseInferenceContext | None = None,
++    loss_mask: Tensor | None = None,
+     temperature: float = 1.0,
+     padding_mask: Tensor | None = None,
++    projection_mask: Tensor | None = None,
+     **kwargs,
+ ) -> CausalLMOutputForPPO:
+     """
+@@ -455,9 +505,6 @@ def _fused_GPTModel_forward(
+         attentions=None,
+     )
+ 
+-    if model.config.sequence_parallel:
+-        hidden_states = gather_from_sequence_parallel_region(hidden_states)
+-
+     # Get the output weight - use embedding weight if output_layer is None or weight is shared
+     if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
+         output_weight = model.output_layer.weight
+@@ -465,13 +512,13 @@ def _fused_GPTModel_forward(
+         # When embeddings are tied, use the embedding weight
+         output_weight = model.embedding.word_embeddings.weight
+ 
+-    logprobs, entropy = linear_cross_entropy(
++    logprobs, entropy = _compute_fused_lm_head(
+         hidden_states,
+         output_weight,
+         labels,
+         temperature,
+-        "none",
+-        parallel_state.get_tensor_model_parallel_group(),
++        model.config.sequence_parallel,
++        projection_mask,
+     )
+ 
+     if has_config_logger_enabled(model.config):
 diff --git a/verl/models/mcore/response_only_lm_head.py b/verl/models/mcore/response_only_lm_head.py
 new file mode 100644
-index 00000000..3efc6576
+index 00000000..270bb82d
 --- /dev/null
 +++ b/verl/models/mcore/response_only_lm_head.py
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,153 @@
 +# Copyright 2026 Bytedance Ltd. and/or its affiliates
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -538,6 +596,22 @@ index 00000000..3efc6576
 +from contextlib import contextmanager
 +
 +import torch
++
++
++def select_response_only_hidden_states(hidden_states: torch.Tensor, projection_mask: torch.Tensor) -> torch.Tensor:
++    """Select batch-major active rows from gathered [sequence, batch, hidden] states."""
++    expected = (projection_mask.shape[1], projection_mask.shape[0])
++    if hidden_states.shape[:2] != expected:
++        raise RuntimeError(
++            "LM-head hidden states and response projection mask are misaligned: "
++            f"hidden={tuple(hidden_states.shape)}, mask={tuple(projection_mask.shape)}"
++        )
++    selected = hidden_states.transpose(0, 1)[projection_mask]
++    if selected.numel() == 0:
++        # Keep empty CP ranks in the distributed backward graph. Restoration
++        # connects this dummy row to the loss with zero gradient.
++        selected = hidden_states[:1, :1, :].reshape(1, hidden_states.shape[-1])
++    return selected.reshape(-1, 1, hidden_states.shape[-1]).contiguous()
 +
 +
 +def _get_output_layer(model):
@@ -593,19 +667,7 @@ index 00000000..3efc6576
 +                group=getattr(output_layer, "tp_group", None),
 +            )
 +
-+        expected = (projection_mask.shape[1], projection_mask.shape[0])
-+        if hidden_states.shape[:2] != expected:
-+            raise RuntimeError(
-+                "LM-head hidden states and response projection mask are misaligned: "
-+                f"hidden={tuple(hidden_states.shape)}, mask={tuple(projection_mask.shape)}"
-+            )
-+
-+        selected = hidden_states.transpose(0, 1)[projection_mask]
-+        if selected.numel() == 0:
-+            # Keep every TP/CP rank in the LM-head backward graph. The matching
-+            # scalar result is multiplied by zero before it reaches the loss.
-+            selected = hidden_states[:1, :1, :].reshape(1, hidden_states.shape[-1])
-+        selected = selected.reshape(-1, 1, hidden_states.shape[-1]).contiguous()
++        selected = select_response_only_hidden_states(hidden_states, projection_mask)
 +
 +        if args:
 +            return (selected, *args[1:]), kwargs
@@ -670,10 +732,10 @@ index 00000000..3efc6576
 +        restored[name] = dense
 +    return restored
 diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
-index f6212520..27c30bf3 100644
+index bd912745..635c3737 100644
 --- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
 +++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
-@@ -58,6 +58,7 @@ actor_rollout_ref:
+@@ -57,6 +57,7 @@ actor_rollout_ref:
        use_dist_checkpointing: false
        dist_checkpointing_path: null
        dynamic_context_parallel: false
@@ -681,7 +743,7 @@ index f6212520..27c30bf3 100644
        max_seqlen_per_dp_cp_rank: null
        dist_checkpointing_prefix: ''
        dist_ckpt_optim_fully_reshardable: false
-@@ -268,6 +269,7 @@ actor_rollout_ref:
+@@ -266,6 +267,7 @@ actor_rollout_ref:
        use_dist_checkpointing: false
        dist_checkpointing_path: null
        dynamic_context_parallel: ${oc.select:actor_rollout_ref.actor.megatron.dynamic_context_parallel,False}
@@ -689,7 +751,7 @@ index f6212520..27c30bf3 100644
        max_seqlen_per_dp_cp_rank: ${oc.select:actor_rollout_ref.actor.megatron.max_seqlen_per_dp_cp_rank,null}
        dist_checkpointing_prefix: ''
        dist_ckpt_optim_fully_reshardable: false
-@@ -600,6 +602,7 @@ critic:
+@@ -599,6 +601,7 @@ critic:
      use_dist_checkpointing: false
      dist_checkpointing_path: null
      dynamic_context_parallel: false
@@ -698,10 +760,10 @@ index f6212520..27c30bf3 100644
      dist_checkpointing_prefix: ''
      dist_ckpt_optim_fully_reshardable: false
 diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
-index f1e2ba40..21fb1d82 100644
+index 5cdf917d..010c84d5 100644
 --- a/verl/trainer/config/engine/megatron.yaml
 +++ b/verl/trainer/config/engine/megatron.yaml
-@@ -43,6 +43,10 @@ dist_checkpointing_path: null
+@@ -40,6 +40,10 @@ dist_checkpointing_path: null
  # Whether to use dynamic context parallel scheduling
  dynamic_context_parallel: False
  
@@ -713,10 +775,10 @@ index f1e2ba40..21fb1d82 100644
  # when dynamic_context_parallel=True.
  max_seqlen_per_dp_cp_rank: null
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
-index 5df864ab..aa7ffb93 100644
+index 63783752..94dfb837 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
-@@ -164,6 +164,8 @@ class McoreEngineConfig(EngineConfig):
+@@ -161,6 +161,8 @@ class McoreEngineConfig(EngineConfig):
              for interleaved scheduling.
          context_parallel_size (int): Context parallel size for long sequences.
          dynamic_context_parallel (bool): Whether to enable dynamic context parallel scheduling.
@@ -725,7 +787,7 @@ index 5df864ab..aa7ffb93 100644
          max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
          sequence_parallel (bool): Whether to enable sequence parallelism.
          use_distributed_optimizer (bool): Whether to use distributed optimizer.
-@@ -192,6 +194,7 @@ class McoreEngineConfig(EngineConfig):
+@@ -189,6 +191,7 @@ class McoreEngineConfig(EngineConfig):
      virtual_pipeline_model_parallel_size: Optional[int] = None
      context_parallel_size: int = 1
      dynamic_context_parallel: bool = False
@@ -734,7 +796,7 @@ index 5df864ab..aa7ffb93 100644
      entropy_from_logits_chunk_size: int = 2048
      max_seqlen_per_dp_cp_rank: Optional[int] = None
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index e8a6c560..a2f0c129 100644
+index ae473382..98891626 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -28,6 +28,10 @@ from tensordict import TensorDict
@@ -748,21 +810,7 @@ index e8a6c560..a2f0c129 100644
  from verl.trainer.config import CheckpointConfig
  from verl.utils import tensordict_utils as tu
  from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
-@@ -514,6 +518,13 @@ class MegatronEngine(BaseEngine):
-         if not self.engine_config.use_fused_kernels:
-             return
- 
-+        if self.engine_config.response_only_lm_head:
-+            logger.warning_once(
-+                "response_only_lm_head requires the unfused Megatron forward path; disabling fused kernels"
-+            )
-+            self.engine_config.use_fused_kernels = False
-+            return
-+
-         if not self.engine_config.use_remove_padding or self.is_value_model or self.model_config.mtp.enable:
-             logger.warning_once(
-                 "Fused kernels require remove-padding and are not supported for value models or when MTP is enabled "
-@@ -1183,8 +1194,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1192,8 +1196,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
          logits_processor_func: Callable,
          batch: TensorDict,
          data_format: str,
@@ -777,7 +825,7 @@ index e8a6c560..a2f0c129 100644
          # avoid non-positive temperature such as padding
          temperature[temperature <= 0] = 1e-8
          assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
-@@ -1220,6 +1236,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1229,6 +1238,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
          if not distillation_only:
              ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
  
@@ -786,7 +834,7 @@ index e8a6c560..a2f0c129 100644
          return ret
  
      def forward_step(
-@@ -1240,6 +1258,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1249,6 +1260,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
          calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
          distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
@@ -802,7 +850,26 @@ index e8a6c560..a2f0c129 100644
          pad_to_length_bucket = (
              self.engine_config.pad_to_length_bucket
              if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
-@@ -1381,6 +1408,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1322,6 +1342,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         if use_fused_kernels:
+             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
+ 
++            response_attention_mask = None
++            if self.engine_config.response_only_lm_head and attention_mask is not None and not loss_mask.is_nested:
++                response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
+             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
+             output = fused_forward_fn(
+                 model=model,
+@@ -1335,6 +1358,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 local_cp_size=local_cp_size,
+                 router_padding_mask=router_padding_mask,
+                 pad_to_length_bucket=pad_to_length_bucket,
++                loss_mask=loss_mask if self.engine_config.response_only_lm_head else None,
++                response_attention_mask=response_attention_mask,
+             )
+         else:
+             if not isinstance(temperature, torch.Tensor):
+@@ -1390,6 +1415,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                  pad_token_id=self.model_config.tokenizer.pad_token_id,
                  data_format=data_format,
                  mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
@@ -810,6 +877,3 @@ index e8a6c560..a2f0c129 100644
                  local_cp_size=local_cp_size,
                  router_padding_mask=router_padding_mask,
                  mtp_loss_normalization_factor=mtp_loss_normalization_factor,
--- 
-2.51.0.windows.2
-

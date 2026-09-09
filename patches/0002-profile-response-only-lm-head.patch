@@ -1,64 +1,98 @@
-From 45251f244d7b7475c5a02b28400ce1035f0258a0 Mon Sep 17 00:00:00 2001
+From 627c9d85d4a315b9d1fc9347255661962b20f847 Mon Sep 17 00:00:00 2001
 From: qiangyupei <492261796@qq.com>
-Date: Thu, 20 Aug 2026 17:01:07 +0800
-Subject: [PATCH 2/2] [megatron, perf] test: profile response-only LM-head
- savings
+Date: Wed, 9 Sep 2026 11:14:02 +0800
+Subject: [PATCH 2/2] [megatron, perf] test: profile fused response-only LM
+ head
 
-Add opt-in synchronized timing and accelerator-memory diagnostics around the LM-head and vocabulary-processing region, plus an A/B log summarizer and focused CPU coverage.
+Measure fused projected rows, latency, and workspace memory, and add a cached-trajectory A/B workflow for remote GPU validation.
 
 Assisted-by: OpenAI Codex
 ---
- docs/perf/perf_tuning.rst                     |  25 +++
- .../summarize_response_only_lm_head.py        | 204 ++++++++++++++++++
- .../test_response_only_lm_head_on_cpu.py      |  41 ++++
- ...nse_only_lm_head_profile_summary_on_cpu.py |  94 ++++++++
- verl/models/mcore/model_forward.py            |  68 ++++--
- .../mcore/response_only_lm_head_profile.py    | 144 +++++++++++++
- .../engine/megatron/transformer_impl.py       |  29 ++-
- 7 files changed, 585 insertions(+), 20 deletions(-)
+ docs/perf/response_only_lm_head_validation.md |  54 +++++
+ .../summarize_response_only_lm_head.py        | 205 ++++++++++++++++++
+ rlmh_test.sh                                  | 103 +++++++++
+ ...st_response_only_lm_head_profile_on_cpu.py | 148 +++++++++++++
+ .../test_response_only_lm_head.py             |  96 ++++++++
+ ...nse_only_lm_head_profile_summary_on_cpu.py | 111 ++++++++++
+ verl/models/mcore/model_forward.py            |  62 ++++--
+ verl/models/mcore/model_forward_fused.py      |  31 ++-
+ .../mcore/response_only_lm_head_profile.py    | 165 ++++++++++++++
+ .../engine/megatron/transformer_impl.py       |  40 +++-
+ 10 files changed, 991 insertions(+), 24 deletions(-)
+ create mode 100644 docs/perf/response_only_lm_head_validation.md
  create mode 100644 examples/profile/summarize_response_only_lm_head.py
+ create mode 100644 rlmh_test.sh
+ create mode 100644 tests/models/mcore/test_response_only_lm_head_profile_on_cpu.py
+ create mode 100644 tests/special_distributed/test_response_only_lm_head.py
  create mode 100644 tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
  create mode 100644 verl/models/mcore/response_only_lm_head_profile.py
 
-diff --git a/docs/perf/perf_tuning.rst b/docs/perf/perf_tuning.rst
-index 374d901d..bd492f91 100644
---- a/docs/perf/perf_tuning.rst
-+++ b/docs/perf/perf_tuning.rst
-@@ -267,3 +267,28 @@ The expected LM-head logits reduction is proportional to the active-row ratio
- ``loss_mask.sum() / input_tokens``. This option uses the unfused forward path
- and currently does not support MTP training or top-k distillation. It is most
- useful when the active-row ratio is low and the vocabulary is large.
+diff --git a/docs/perf/response_only_lm_head_validation.md b/docs/perf/response_only_lm_head_validation.md
+new file mode 100644
+index 00000000..34a06e18
+--- /dev/null
++++ b/docs/perf/response_only_lm_head_validation.md
+@@ -0,0 +1,54 @@
++# Response-only LM head validation
 +
-+Profiling response-only LM-head savings
-+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++Use `lm_head_test2` from `https://github.com/qiangyupei/verl`. It contains the functional changes rebased on verl `main` plus optional profiling, without historical experiment logs. Run from the repository root in a compatible CUDA/Megatron training environment. Install this checkout into that environment (`uv pip install -e . --no-deps`) and confirm `python -c "import verl; print(verl.__file__)"` points to this checkout.
 +
-+Run dedicated baseline and optimized jobs with the unfused Megatron path and
-+the following environment variable::
++## 1. Check values and non-zero gradients
 +
-+    VERL_RESPONSE_ONLY_LM_HEAD_PROFILE=1
++```bash
++CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --standalone --nproc_per_node=4 \
++  -m pytest -q tests/special_distributed/test_response_only_lm_head.py
++```
 +
-+Use identical inputs and set ``response_only_lm_head=False`` for the baseline
-+and ``True`` for the optimized run. The profiler emits one
-+``VERL_RESPONSE_ONLY_LM_HEAD_PROFILE`` JSON record per LM-head invocation on
-+each rank of the final pipeline stage. Each record contains the active-row
-+ratio, synchronized LM-head plus forward vocabulary-processing latency, actual
-+and dense-equivalent local logits bytes, and accelerator peak allocation over
-+that measured region. It does not measure backward, optimizer, end-to-end step
-+time, or process-wide training peak memory.
++This runs the real fused kernel with TP=2 and CP=2. It compares full-row and selected-row results against a full-vocabulary Torch reference, with SP on/off, FP32/BF16, entropy on/off, internal masked spans, and an empty CP shard. All four ranks must finish without failures. It tests the LM-head boundary, not the full PP model. This test has not been run on the development machine, which has CPU-only PyTorch.
 +
-+The profiler synchronizes the accelerator and resets peak-memory statistics at
-+the LM-head boundary. This is intentional for controlled A/B measurement but
-+perturbs performance and process-wide peak-memory counters, so do not enable it
-+during production training. Summarize two captured logs with::
++## 2. Run one cache-fill and four measured four-step jobs
 +
-+    python examples/profile/summarize_response_only_lm_head.py \
-+        --baseline baseline.log --optimized response_only.log --warmup 2
++```bash
++export MODEL_PATH=/home/p00938733/Qwen3-8B
++export TRAIN_FILE=/path/to/ruler-8k/train.parquet
++export VAL_FILE=/path/to/ruler-8k/test.parquet
++
++MAX_PROMPT_LENGTH=8192 MAX_RESPONSE_LENGTH=8192 bash rlmh_test.sh
++```
++
++For the prompt-heavy workload, use its separately generated parquet files and run:
++
++```bash
++TRAIN_FILE=/path/to/ruler-30k/train.parquet \
++VAL_FILE=/path/to/ruler-30k/test.parquet \
++MAX_PROMPT_LENGTH=32768 MAX_RESPONSE_LENGTH=4096 bash rlmh_test.sh
++```
++
++Sequence limits do not generate or lengthen prompts: the parquet must already contain tokenized prompts of the intended length. The script sets `ignore_eos=true` for a fixed-length response stress test. Keep the total sequence within the model's supported context window.
++
++Each invocation runs exactly these jobs on eight GPUs (TP=2, PP=2, CP=2, SP=true, rollout TP=4):
++
++| Job | Response-only | Fused | Trajectories |
++| --- | --- | --- | --- |
++| `01-cache` | off | off | Generate/cache four steps |
++| `02-unfused-baseline` | off | off | Reuse cached trajectories |
++| `03-unfused-response-only` | on | off | Reuse the same trajectories |
++| `04-fused-baseline` | off | on | Reuse the same trajectories |
++| `05-fused-response-only` | on | on | Reuse the same trajectories |
++
++Use a fresh default cache directory for each workload. Verify jobs 02--05 report trajectory-cache hits. Learning rate is zero to keep model weights fixed; entropy coefficient is 0.001 to produce non-zero gradients even if all NIAH rewards are 1. Confirm a non-zero actor gradient norm, matched token counts, and matching selected-token log-probabilities, entropy, loss, and gradient norms within the precision tolerance appropriate to your stack. A100 training execution remains required to validate the entire TP/SP/CP/PP path.
++
++The four measured jobs cover the full `use_fused_kernels` x `response_only_lm_head` matrix in one invocation. Extra Hydra arguments can be appended to the command; the script keeps the two feature switches under its own control so every combination is exercised.
++
++## 3. Read the results
++
++The script writes logs, `summary-unfused.log`, and `summary-fused.log` under `rlmh-combination-logs/<run-id>/`. The first summary compares jobs 02 and 03; the second compares jobs 04 and 05. This isolates the incremental benefit of response-only projection both without fusion and on top of the fused kernel. The optimized arm should show fewer `projected_rows`; empty CP shards use one dummy row.
++
++Unfused records report the materialized logits size, while both fused arms report zero materialized logits bytes. For fused runs, the useful measurements are synchronized LM-head forward latency and the measured incremental peak allocation, which includes temporary kernel workspace. These are not backward timings or whole-training peak memory. The summarizer intentionally compares only equal backends because fused and unfused records have different memory semantics. Whole-step timing can still be compared manually across jobs 02/04 and 03/05. Check individual rank records too: CP ranks can have different active-row ratios, and Ray log forwarding may omit ranks.
++
++Treat step 1 as warmup when comparing training-stage or whole-step times. The summarizer's `--warmup 2` discards two LM-head invocations per rank/stream, not an entire training step. Profiling synchronizes the device and resets peak counters; for production throughput evidence, repeat longer reversed-order runs with `PROFILE=0`. The historical unfused A100 results do not measure the new fused combination.
 diff --git a/examples/profile/summarize_response_only_lm_head.py b/examples/profile/summarize_response_only_lm_head.py
 new file mode 100644
-index 00000000..623ce490
+index 00000000..5646785d
 --- /dev/null
 +++ b/examples/profile/summarize_response_only_lm_head.py
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,205 @@
 +# Copyright 2026 Bytedance Ltd. and/or its affiliates
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,6 +117,7 @@ index 00000000..623ce490
 +PREFIX = "VERL_RESPONSE_ONLY_LM_HEAD_PROFILE "
 +GIB = 1024**3
 +GROUP_FIELDS = (
++    "backend",
 +    "role",
 +    "data_format",
 +    "calculate_entropy",
@@ -123,7 +158,7 @@ index 00000000..623ce490
 +
 +
 +def group_key(record: dict) -> tuple:
-+    return tuple(record.get(field) for field in GROUP_FIELDS)
++    return tuple(record.get(field, "unfused" if field == "backend" else None) for field in GROUP_FIELDS)
 +
 +
 +def validate_records(records: list[dict], *, response_only_enabled: bool) -> None:
@@ -263,39 +298,174 @@ index 00000000..623ce490
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/tests/models/mcore/test_response_only_lm_head_on_cpu.py b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
-index a5cc3ec3..5a9155e6 100644
---- a/tests/models/mcore/test_response_only_lm_head_on_cpu.py
-+++ b/tests/models/mcore/test_response_only_lm_head_on_cpu.py
-@@ -12,6 +12,8 @@
- # See the License for the specific language governing permissions and
- # limitations under the License.
- 
+diff --git a/rlmh_test.sh b/rlmh_test.sh
+new file mode 100644
+index 00000000..273be995
+--- /dev/null
++++ b/rlmh_test.sh
+@@ -0,0 +1,103 @@
++#!/usr/bin/env bash
++# One cache-fill run plus four measured fused/response-only combinations.
++set -Eeuo pipefail
++
++: "${MODEL_PATH:?Set MODEL_PATH to the local Qwen3-8B model}"
++: "${TRAIN_FILE:?Set TRAIN_FILE to the training parquet file}"
++VAL_FILE=${VAL_FILE:-$TRAIN_FILE}
++PROFILE=${PROFILE:-1}
++MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-8192}
++MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
++RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
++CACHE_ROOT=${CACHE_ROOT:-$PWD/rlmh-cache/$RUN_ID}
++LOG_DIR=${LOG_DIR:-$PWD/rlmh-combination-logs/$RUN_ID}
++export DEVICE=gpu VERL_USE_UV=0 RAY_DEDUP_LOGS=0
++export CUDA_DEVICE_MAX_CONNECTIONS=1
++mkdir -p "$CACHE_ROOT" "$LOG_DIR"
++
++COMMON=(
++  "actor_rollout_ref.model.path=$MODEL_PATH"
++  "data.train_files=$TRAIN_FILE"
++  "data.val_files=$VAL_FILE"
++  "data.max_prompt_length=$MAX_PROMPT_LENGTH"
++  "data.max_response_length=$MAX_RESPONSE_LENGTH"
++  data.train_batch_size=1
++  data.gen_batch_size=1
++  data.shuffle=false
++  data.seed=42
++  actor_rollout_ref.model.use_remove_padding=true
++  actor_rollout_ref.actor.megatron.vanilla_mbridge=false
++  actor_rollout_ref.actor.megatron.use_remove_padding=true
++  actor_rollout_ref.actor.megatron.sequence_parallel=true
++  actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2
++  actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2
++  actor_rollout_ref.actor.megatron.context_parallel_size=2
++  actor_rollout_ref.ref.megatron.sequence_parallel=true
++  actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2
++  actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2
++  actor_rollout_ref.ref.megatron.context_parallel_size=2
++  "actor_rollout_ref.actor.megatron.param_offload=${ALL_OFFLOAD:-true}"
++  "actor_rollout_ref.actor.megatron.optimizer_offload=${ALL_OFFLOAD:-true}"
++  "actor_rollout_ref.actor.megatron.grad_offload=${ALL_OFFLOAD:-true}"
++  "actor_rollout_ref.ref.megatron.param_offload=${ALL_OFFLOAD:-true}"
++  actor_rollout_ref.actor.ppo_mini_batch_size=1
++  actor_rollout_ref.actor.data_loader_seed=42
++  actor_rollout_ref.actor.optim.lr=0.0
++  # Exercise backward even when every NIAH completion receives reward 1.
++  actor_rollout_ref.actor.calculate_entropy=true
++  actor_rollout_ref.actor.entropy_coeff=0.001
++  actor_rollout_ref.rollout.n=2
++  actor_rollout_ref.rollout.seed=42
++  actor_rollout_ref.rollout.tensor_model_parallel_size=4
++  actor_rollout_ref.rollout.gpu_memory_utilization=0.5
++  actor_rollout_ref.rollout.ignore_eos=true
++  "actor_rollout_ref.rollout.max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))"
++  trainer.use_v1=true
++  trainer.v1.trainer_mode=sync
++  trainer.total_training_steps=4
++  trainer.resume_mode=disable
++  trainer.val_before_train=false
++  trainer.n_gpus_per_node=8
++  trainer.nnodes=1
++  'trainer.logger=["console"]'
++  trainer.project_name=rlmh_combinations_a100
++  trainer.experiment_name=rlmh_combinations_a100
++  trainer.save_freq=-1
++  trainer.test_freq=-1
++  skip.rollout.enable=false
++  skip.rollout_tq.enable=true
++  "skip.rollout_tq.dump_dir=$CACHE_ROOT"
++  'skip.rollout_tq.steps=[1,2,3,4]'
++  skip.rollout_tq.action=cache
++)
++
++run_case() {
++  local name=$1 fused=$2 enabled=$3 profile=$4
++  shift 4
++  bash examples/grpo_trainer/run_qwen3_8b_megatron.sh \
++    "${COMMON[@]}" "$@" \
++    "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_RESPONSE_ONLY_LM_HEAD_PROFILE=\"$profile\"" \
++    "actor_rollout_ref.model.use_fused_kernels=$fused" \
++    "actor_rollout_ref.actor.megatron.response_only_lm_head=$enabled" \
++    "actor_rollout_ref.ref.megatron.response_only_lm_head=$enabled" \
++    2>&1 | tee "$LOG_DIR/$name.log"
++}
++
++run_case 01-cache false false 0 "$@"
++run_case 02-unfused-baseline false false "$PROFILE" "$@"
++run_case 03-unfused-response-only false true "$PROFILE" "$@"
++run_case 04-fused-baseline true false "$PROFILE" "$@"
++run_case 05-fused-response-only true true "$PROFILE" "$@"
++
++if [[ $PROFILE == 1 ]]; then
++  python examples/profile/summarize_response_only_lm_head.py \
++    --baseline "$LOG_DIR/02-unfused-baseline.log" \
++    --optimized "$LOG_DIR/03-unfused-response-only.log" \
++    --warmup 2 | tee "$LOG_DIR/summary-unfused.log"
++  python examples/profile/summarize_response_only_lm_head.py \
++    --baseline "$LOG_DIR/04-fused-baseline.log" \
++    --optimized "$LOG_DIR/05-fused-response-only.log" \
++    --warmup 2 | tee "$LOG_DIR/summary-fused.log"
++fi
++echo "Logs: $LOG_DIR"
++echo "Cache: $CACHE_ROOT"
+diff --git a/tests/models/mcore/test_response_only_lm_head_profile_on_cpu.py b/tests/models/mcore/test_response_only_lm_head_profile_on_cpu.py
+new file mode 100644
+index 00000000..eaf62ced
+--- /dev/null
++++ b/tests/models/mcore/test_response_only_lm_head_profile_on_cpu.py
+@@ -0,0 +1,148 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
 +import json
 +from contextlib import nullcontext
- from unittest.mock import patch
- 
- import pytest
-@@ -23,6 +25,10 @@ from verl.models.mcore.response_only_lm_head import (
-     restore_response_only_outputs,
-     select_response_only_inputs,
- )
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++import torch
++
++from verl.models.mcore import model_forward_fused as mff
++from verl.models.mcore.response_only_lm_head import response_only_output_projection
 +from verl.models.mcore.response_only_lm_head_profile import (
 +    PROFILE_PREFIX,
 +    ResponseOnlyLMHeadProfiler,
 +)
- from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
- 
- 
-@@ -182,3 +188,38 @@ def test_empty_local_response_mask_keeps_a_zero_gradient_path():
-     assert hidden.grad is not None and model.output_layer.weight.grad is not None
-     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden.grad))
-     torch.testing.assert_close(model.output_layer.weight.grad, torch.zeros_like(model.output_layer.weight.grad))
++
++
++class _OutputLayer(torch.nn.Module):
++    def __init__(self, hidden_size, vocab_size):
++        super().__init__()
++        self.sequence_parallel = False
++        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size))
++
++    def forward(self, input_):
++        return torch.nn.functional.linear(input_, self.weight), None
++
++
++class _Model(torch.nn.Module):
++    def __init__(self, output_layer):
++        super().__init__()
++        self.output_layer = output_layer
++
++    def forward(self, hidden_states):
++        logits, _ = self.output_layer(hidden_states)
++        return logits.transpose(0, 1).contiguous()
 +
 +
 +@pytest.mark.parametrize(("enabled", "projected_rows"), [(False, 8), (True, 4)])
 +def test_profiler_records_projection_rows_and_logits_memory(enabled, projected_rows):
-+    model = _Model(_FakeLinearOutputLayer(hidden_size=3, vocab_size=5))
++    model = _Model(_OutputLayer(3, 5))
 +    hidden = torch.randn(4, 2, 3)
 +    projection_mask = torch.tensor([[False, True, True, False], [True, False, True, False]])
 +    profiler = ResponseOnlyLMHeadProfiler(
@@ -326,12 +496,179 @@ index a5cc3ec3..5a9155e6 100644
 +    assert record["dense_logits_bytes"] == 8 * 5 * logits.element_size()
 +    assert record["actual_logits_bytes"] == projected_rows * 5 * logits.element_size()
 +    assert record["logits_saved_bytes"] == (8 - projected_rows) * 5 * logits.element_size()
++
++
++@pytest.mark.parametrize("mode", ["hook", "legacy"])
++@pytest.mark.parametrize("enabled", [False, True])
++def test_fused_engine_profiler_keeps_baseline_dense(mode, enabled):
++    input_ids = torch.nested.as_nested_tensor([torch.tensor([0, 1, 2, 3])], layout=torch.jagged)
++    loss_mask = torch.nested.as_nested_tensor([torch.tensor([0, 1])], layout=torch.jagged)
++    hidden = torch.randn(4, 1, 3)
++
++    class Model(_Model):
++        pre_process = True
++        post_process = True
++        config = SimpleNamespace(fp8=None, sequence_parallel=False)
++        _verl_fused_forward_mode = mode
++
++        def _preprocess(self, **kwargs):
++            return hidden, None, None, None, None
++
++        def decoder(self, **kwargs):
++            return kwargs["hidden_states"]
++
++        def forward(self, **kwargs):
++            if mode == "legacy":
++                return mff._fused_GPTModel_forward(self, **kwargs)
++            return kwargs["output_processor"](
++                hidden_states=hidden,
++                output_layer=self.output_layer,
++                output_weight=None,
++                labels=kwargs["labels"],
++                context=kwargs["output_processor_context"],
++                config=self.config,
++            )
++
++    def kernel(h, w, labels, *args):
++        logits = h.reshape(-1, 3) @ w.T
++        return logits.sum(-1), logits.square().sum(-1)
++
++    with (
++        patch.object(mff.parallel_state, "get_context_parallel_world_size", return_value=1),
++        patch.object(mff.parallel_state, "get_context_parallel_rank", return_value=0),
++        patch.object(mff.parallel_state, "get_tensor_model_parallel_world_size", return_value=1),
++        patch.object(mff.parallel_state, "get_tensor_model_parallel_group", return_value=None),
++        patch.object(mff, "postprocess_thd_engine", side_effect=lambda value, *args, **kwargs: value),
++        patch.object(mff, "has_config_logger_enabled", return_value=False),
++        patch.object(mff, "linear_cross_entropy", side_effect=kernel),
++        patch("verl.models.mcore.response_only_lm_head_profile.logger.warning") as warning,
++    ):
++        mff.fused_forward_model_engine()(
++            Model(_OutputLayer(3, 5)),
++            input_ids,
++            input_ids,
++            {},
++            1.0,
++            True,
++            0,
++            loss_mask=loss_mask,
++            response_only_lm_head_profile={"response_only_enabled": enabled},
++        )
++    warning.assert_called_once()
++    record = json.loads(warning.call_args.args[2])
++    assert record["backend"] == "fused"
++    assert record["selected_rows"] == 1
++    assert record["dense_rows"] == 4
++    assert record["projected_rows"] == (1 if enabled else 4)
++    assert record["actual_logits_bytes"] == record["dense_logits_bytes"] == record["logits_saved_bytes"] == 0
+diff --git a/tests/special_distributed/test_response_only_lm_head.py b/tests/special_distributed/test_response_only_lm_head.py
+new file mode 100644
+index 00000000..d4098430
+--- /dev/null
++++ b/tests/special_distributed/test_response_only_lm_head.py
+@@ -0,0 +1,96 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Run with: torchrun --standalone --nproc_per_node=4 -m pytest -q {file}."""
++
++import os
++from datetime import timedelta
++
++import pytest
++import torch
++import torch.distributed as dist
++from megatron.core import parallel_state as mpu
++
++from verl.models.mcore.model_forward_fused import _compute_fused_lm_head
++
++
++@pytest.fixture(scope="module", autouse=True)
++def parallel_groups():
++    if not torch.cuda.is_available() or "LOCAL_RANK" not in os.environ:
++        pytest.skip("Requires torchrun with four CUDA GPUs")
++    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
++    dist.init_process_group("nccl", timeout=timedelta(minutes=5))
++    assert dist.get_world_size() == 4, "Use four ranks for TP=2, CP=2"
++    mpu.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
++    yield
++    mpu.destroy_model_parallel()
++    dist.destroy_process_group()
++
++
++@pytest.mark.parametrize(
++    ("sequence_parallel", "empty_cp_rank", "entropy_coeff", "dtype"),
++    [
++        (False, False, 0.0, torch.float32),
++        (True, False, 0.1, torch.bfloat16),
++        (False, True, 0.1, torch.bfloat16),
++        (True, True, 0.1, torch.bfloat16),
++    ],
++)
++def test_fused_head_matches_dense_reference(sequence_parallel, empty_cp_rank, entropy_coeff, dtype):
++    tp_rank = mpu.get_tensor_model_parallel_rank()
++    cp_rank = mpu.get_context_parallel_rank()
++    rows, hidden_size, vocab_size = 128, 256, 4096
++    torch.manual_seed(42)
++    weight = (torch.randn(vocab_size, hidden_size, device="cuda") * 0.02).to(dtype)
++    torch.manual_seed(43 + cp_rank)
++    hidden = torch.randn(rows, 1, hidden_size, device="cuda", dtype=dtype)
++    labels = torch.randint(vocab_size, (1, rows), device="cuda")
++    mask = torch.ones_like(labels, dtype=torch.bool)
++    mask[:, :96] = False
++    mask[:, 100:110] = False
++    if empty_cp_rank and cp_rank == 0:
++        mask.zero_()
++    coefficients = torch.randn(1, rows, device="cuda") * mask / rows
++
++    ref_hidden = hidden.detach().float().requires_grad_()
++    ref_weight = weight.detach().float().requires_grad_()
++    ref_log_probs = (ref_hidden[:, 0] @ ref_weight.T / 0.7).log_softmax(-1)
++    ref_entropy = -(ref_log_probs.exp() * ref_log_probs).sum(-1).reshape(1, rows)
++    ref_log_probs = ref_log_probs.gather(-1, labels.T).T
++    ((ref_log_probs + entropy_coeff * ref_entropy) * coefficients).sum().backward()
++
++    token_slice = slice(tp_rank * (rows // 2), (tp_rank + 1) * (rows // 2)) if sequence_parallel else slice(None)
++    vocab_slice = slice(tp_rank * (vocab_size // 2), (tp_rank + 1) * (vocab_size // 2))
++    results = []
++    for projection_mask in (None, mask):
++        local_hidden = hidden[token_slice].clone().requires_grad_()
++        local_weight = weight[vocab_slice].clone().requires_grad_()
++        log_probs, entropy = _compute_fused_lm_head(
++            local_hidden, local_weight, labels, 0.7, sequence_parallel, projection_mask
++        )
++        log_probs, entropy = log_probs.reshape_as(mask), entropy.reshape_as(mask)
++        ((log_probs + entropy_coeff * entropy) * coefficients).sum().backward()
++        torch.testing.assert_close(log_probs[mask], ref_log_probs[mask], rtol=3e-3, atol=3e-2)
++        torch.testing.assert_close(entropy[mask], ref_entropy[mask], rtol=3e-3, atol=3e-2)
++        torch.testing.assert_close(local_hidden.grad.float(), ref_hidden.grad[token_slice], rtol=3e-2, atol=1e-4)
++        torch.testing.assert_close(local_weight.grad.float(), ref_weight.grad[vocab_slice], rtol=3e-2, atol=1e-4)
++        results.append((local_hidden.grad.float(), local_weight.grad.float()))
++
++    for actual, expected in zip(results[1], results[0], strict=True):
++        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1e-4)
++
++    actual_weight_grad = results[1][1].clone()
++    expected_weight_grad = ref_weight.grad[vocab_slice].contiguous()
++    dist.all_reduce(actual_weight_grad, group=mpu.get_context_parallel_group())
++    dist.all_reduce(expected_weight_grad, group=mpu.get_context_parallel_group())
++    torch.testing.assert_close(actual_weight_grad, expected_weight_grad, rtol=3e-2, atol=1e-4)
 diff --git a/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py b/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
 new file mode 100644
-index 00000000..87f561d2
+index 00000000..e2d21f80
 --- /dev/null
 +++ b/tests/utils/test_response_only_lm_head_profile_summary_on_cpu.py
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,111 @@
 +# Copyright 2026 Bytedance Ltd. and/or its affiliates
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -426,8 +763,25 @@ index 00000000..87f561d2
 +
 +    with pytest.raises(ValueError, match="expected response_only_enabled=False"):
 +        summary.validate_records(records, response_only_enabled=False)
++
++
++def test_fused_summary_measures_workspace_without_claiming_logits_savings():
++    before = _record(0, 0, enabled=False, elapsed=2, actual_bytes=0, peak_increment=500)
++    after = _record(0, 0, enabled=True, elapsed=1, actual_bytes=0, peak_increment=200)
++    for record in (before, after):
++        record.update(backend="fused", dense_logits_bytes=0, logits_saved_bytes=0)
++    baseline = summary.summarize([before], warmup=0)
++    optimized = summary.summarize([after], warmup=0)
++    comparison = summary.compare(baseline, optimized)[summary.group_key(before)]
++    assert comparison["forward_latency_reduction_pct"] == 50
++    assert comparison["logits_saved_gib"] == 0
++    assert comparison["peak_increment_saved_gib"] == pytest.approx(300 / summary.GIB)
++
++    after["backend"] = "unfused"
++    with pytest.raises(ValueError, match="profile groups differ"):
++        summary.compare(baseline, summary.summarize([after], warmup=0))
 diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
-index cedabfb3..941dd3b4 100644
+index bfaf6983..5a298501 100644
 --- a/verl/models/mcore/model_forward.py
 +++ b/verl/models/mcore/model_forward.py
 @@ -13,7 +13,7 @@
@@ -436,10 +790,10 @@ index cedabfb3..941dd3b4 100644
  # limitations under the License.
 -from contextlib import nullcontext
 +from contextlib import ExitStack, contextmanager
- from typing import Optional
  
  import torch
-@@ -263,6 +263,31 @@ def _build_full_loss_mask_nested(response_mask, input_ids_lengths, response_atte
+ from torch.nested._internal.nested_tensor import NestedTensor
+@@ -262,6 +262,31 @@ def _build_full_loss_mask_nested(response_mask, input_ids_lengths, response_atte
      return torch.nested.nested_tensor(pieces, layout=torch.jagged)
  
  
@@ -471,15 +825,15 @@ index cedabfb3..941dd3b4 100644
  def gptmodel_forward_model_engine(
      model,
      input_ids,
-@@ -275,6 +300,7 @@ def gptmodel_forward_model_engine(
+@@ -274,6 +299,7 @@ def gptmodel_forward_model_engine(
      data_format: str = "thd",
      mtp_enable_train: bool = False,
      response_only_lm_head: bool = False,
 +    response_only_lm_head_profile: dict | None = None,
-     local_cp_size: Optional[int] = None,
-     forced_max_seqlen: Optional[int] = None,
-     pad_to_length_bucket: Optional[int] = None,
-@@ -317,9 +343,14 @@ def gptmodel_forward_model_engine(
+     local_cp_size: int | None = None,
+     forced_max_seqlen: int | None = None,
+     pad_to_length_bucket: int | None = None,
+@@ -314,7 +340,11 @@ def gptmodel_forward_model_engine(
          input_ids_rmpad = input_ids_rmpad.contiguous()
  
          projection_mask = None
@@ -489,14 +843,10 @@ index cedabfb3..941dd3b4 100644
 +            and post_process
 +            and logits_processor is not None
 +        ):
-             if mtp_enable_train:
--                raise NotImplementedError("response_only_lm_head does not support MTP training")
-+                feature = "response_only_lm_head" if response_only_lm_head else "response_only_lm_head profiling"
-+                raise NotImplementedError(f"{feature} does not support MTP training")
              input_ids_lengths = input_ids.offsets().diff().tolist()
              full_loss_mask = _build_full_loss_mask_nested(
                  logits_processor_args["loss_mask"],
-@@ -376,10 +407,9 @@ def gptmodel_forward_model_engine(
+@@ -371,10 +401,9 @@ def gptmodel_forward_model_engine(
          if router_padding_mask is not None:
              model_kwargs["padding_mask"] = router_padding_mask
  
@@ -510,7 +860,7 @@ index cedabfb3..941dd3b4 100644
              output_orig = model(
                  input_ids=input_ids_rmpad,
                  attention_mask=attention_mask,
-@@ -401,9 +431,11 @@ def gptmodel_forward_model_engine(
+@@ -396,9 +425,11 @@ def gptmodel_forward_model_engine(
                  )[0]
                  for k, v in logits_processor_args.items()
              }
@@ -523,7 +873,7 @@ index cedabfb3..941dd3b4 100644
              output = {
                  k: postprocess_thd_engine(
                      v,
-@@ -444,9 +476,14 @@ def gptmodel_forward_model_engine(
+@@ -439,7 +470,11 @@ def gptmodel_forward_model_engine(
          )
  
          projection_mask = None
@@ -533,14 +883,10 @@ index cedabfb3..941dd3b4 100644
 +            and post_process
 +            and logits_processor is not None
 +        ):
-             if mtp_enable_train:
--                raise NotImplementedError("response_only_lm_head does not support MTP training")
-+                feature = "response_only_lm_head" if response_only_lm_head else "response_only_lm_head profiling"
-+                raise NotImplementedError(f"{feature} does not support MTP training")
              input_ids_lengths = input_ids.offsets().diff().tolist()
              full_loss_mask = _build_full_loss_mask_nested(
                  logits_processor_args["loss_mask"],
-@@ -498,10 +535,9 @@ def gptmodel_forward_model_engine(
+@@ -491,10 +526,9 @@ def gptmodel_forward_model_engine(
          else:
              attention_mask = attention_mask_bshd
  
@@ -554,7 +900,7 @@ index cedabfb3..941dd3b4 100644
              output_orig = model(
                  input_ids=input_ids_bshd,
                  attention_mask=attention_mask,
-@@ -519,9 +555,11 @@ def gptmodel_forward_model_engine(
+@@ -512,9 +546,11 @@ def gptmodel_forward_model_engine(
                  )[0]
                  for k, v in logits_processor_args.items()
              }
@@ -567,12 +913,116 @@ index cedabfb3..941dd3b4 100644
              output = {
                  k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
                  for k, v in output_dict.items()
+diff --git a/verl/models/mcore/model_forward_fused.py b/verl/models/mcore/model_forward_fused.py
+index e9edcdb8..839ab78e 100644
+--- a/verl/models/mcore/model_forward_fused.py
++++ b/verl/models/mcore/model_forward_fused.py
+@@ -83,10 +83,15 @@ class FusedOutputProcessorContext:
+ 
+     temperature: float
+     projection_mask: Tensor | None = None
++    profiler: object | None = None
+ 
+ 
+-def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_parallel, projection_mask=None):
++def _compute_fused_lm_head(
++    hidden_states, weight, labels, temperature, sequence_parallel, projection_mask=None, profiler=None
++):
+     """Run the fused head on all rows or only the loss-bearing predictor rows."""
++    if profiler is not None:
++        profiler.start()
+     tp_group = parallel_state.get_tensor_model_parallel_group()
+     if sequence_parallel:
+         hidden_states = gather_from_sequence_parallel_region(hidden_states)
+@@ -103,6 +108,8 @@ def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_
+             labels = labels.new_zeros(1)
+ 
+     log_probs, entropy = linear_cross_entropy(hidden_states, weight, labels, temperature, "none", tp_group)
++    if profiler is not None:
++        profiler.record_fused_projection(hidden_states, weight)
+     if projection_mask is not None:
+         outputs = restore_response_only_outputs(
+             {"log_probs": log_probs.reshape(1, -1), "entropy": entropy.reshape(1, -1)},
+@@ -110,6 +117,8 @@ def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_
+             num_selected,
+         )
+         log_probs, entropy = outputs["log_probs"], outputs["entropy"]
++    if profiler is not None:
++        profiler.finish()
+     return log_probs, entropy
+ 
+ 
+@@ -144,6 +153,7 @@ def fused_output_processor(
+         temperature,
+         config.sequence_parallel,
+         context.projection_mask,
++        context.profiler,
+     )
+ 
+     if has_config_logger_enabled(config):
+@@ -301,6 +311,7 @@ def fused_forward_model_engine(vision_model: bool = False):
+         pad_to_length_bucket: int | None = None,
+         loss_mask: Tensor | None = None,
+         response_attention_mask: Tensor | None = None,
++        response_only_lm_head_profile: dict | None = None,
+     ):
+         pre_process = unwrap_model(model).pre_process
+         post_process = unwrap_model(model).post_process
+@@ -370,6 +381,18 @@ def fused_forward_model_engine(vision_model: bool = False):
+                 cp_layout=cp_layout,
+                 local_cp_size=local_cp_size,
+             )[0].to(torch.bool)
++        profiler = None
++        if response_only_lm_head_profile is not None and post_process:
++            from .response_only_lm_head_profile import ResponseOnlyLMHeadProfiler
++
++            profiler = ResponseOnlyLMHeadProfiler(
++                None,
++                projection_mask,
++                response_only_enabled=response_only_lm_head_profile["response_only_enabled"],
++                metadata=response_only_lm_head_profile,
++            )
++            if not profiler.response_only_enabled:
++                projection_mask = None
+         forward_kwargs = dict(
+             input_ids=input_ids_rmpad,
+             attention_mask=attention_mask,
+@@ -382,11 +405,11 @@ def fused_forward_model_engine(vision_model: bool = False):
+             output_orig: CausalLMOutputForPPO = model(
+                 **forward_kwargs,
+                 output_processor=fused_output_processor,
+-                output_processor_context=FusedOutputProcessorContext(temperature, projection_mask),
++                output_processor_context=FusedOutputProcessorContext(temperature, projection_mask, profiler),
+             )
+         else:
+             output_orig: CausalLMOutputForPPO = model(
+-                temperature=temperature, projection_mask=projection_mask, **forward_kwargs
++                temperature=temperature, projection_mask=projection_mask, lm_head_profiler=profiler, **forward_kwargs
+             )
+ 
+         if not post_process:
+@@ -444,6 +467,7 @@ def _fused_GPTModel_forward(
+     temperature: float = 1.0,
+     padding_mask: Tensor | None = None,
+     projection_mask: Tensor | None = None,
++    lm_head_profiler=None,
+     **kwargs,
+ ) -> CausalLMOutputForPPO:
+     """
+@@ -519,6 +543,7 @@ def _fused_GPTModel_forward(
+         temperature,
+         model.config.sequence_parallel,
+         projection_mask,
++        lm_head_profiler,
+     )
+ 
+     if has_config_logger_enabled(model.config):
 diff --git a/verl/models/mcore/response_only_lm_head_profile.py b/verl/models/mcore/response_only_lm_head_profile.py
 new file mode 100644
-index 00000000..55d91e79
+index 00000000..e83e06bf
 --- /dev/null
 +++ b/verl/models/mcore/response_only_lm_head_profile.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,165 @@
 +# Copyright 2026 Bytedance Ltd. and/or its affiliates
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -620,7 +1070,7 @@ index 00000000..55d91e79
 +        response_only_enabled: bool,
 +        metadata: dict | None = None,
 +    ):
-+        self.output_layer = _get_output_layer(model)
++        self.output_layer = _get_output_layer(model) if model is not None else None
 +        self.projection_mask = projection_mask
 +        self.response_only_enabled = response_only_enabled
 +        self.metadata = dict(metadata or {})
@@ -647,6 +1097,10 @@ index 00000000..55d91e79
 +        return logits
 +
 +    def _before_projection(self, _module, _args, _kwargs):
++        self.start()
++
++    def start(self):
++        """Start at the hidden-state boundary, before SP gather and row selection."""
 +        allocated_before = None
 +        if self._tracks_accelerator_memory:
 +            self._device.synchronize()
@@ -662,6 +1116,7 @@ index 00000000..55d91e79
 +        element_size = logits.element_size()
 +        self._record.update(
 +            {
++                "backend": "unfused",
 +                "projected_rows": projected_rows,
 +                "vocab_shard": vocab_shard,
 +                "logits_dtype": str(logits.dtype),
@@ -671,9 +1126,25 @@ index 00000000..55d91e79
 +            }
 +        )
 +
++    def record_fused_projection(self, hidden_states, weight):
++        """Record kernel input geometry without inventing materialized logits."""
++        self._record.update(
++            {
++                "backend": "fused",
++                "projected_rows": hidden_states.numel() // hidden_states.shape[-1],
++                "vocab_shard": weight.shape[0],
++                "logits_dtype": "none",
++                "element_size": 0,
++                "actual_logits_bytes": 0,
++                "dense_logits_bytes": 0,
++            }
++        )
++
 +    def __enter__(self):
 +        # Register before response_only_output_projection so the timer includes
 +        # explicit SP gather, row selection, and the vocabulary projection.
++        if self.output_layer is None:
++            raise RuntimeError("Unfused LM-head profiling requires an output layer")
 +        self._pre_handle = self.output_layer.register_forward_pre_hook(self._before_projection, with_kwargs=True)
 +        self._post_handle = self.output_layer.register_forward_hook(self._after_projection, with_kwargs=True)
 +        return self
@@ -718,10 +1189,10 @@ index 00000000..55d91e79
 +        if self._pre_handle is not None:
 +            self._pre_handle.remove()
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index a2f0c129..caa91420 100644
+index 98891626..72f0957b 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -1258,15 +1258,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1260,15 +1260,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
          calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
          distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
@@ -739,35 +1210,65 @@ index a2f0c129..caa91420 100644
              raise NotImplementedError("response_only_lm_head does not support MTP training")
 +        if profile_response_only_lm_head and mtp_training:
 +            raise NotImplementedError("response_only_lm_head profiling does not support MTP training")
-+        if profile_response_only_lm_head and use_fused_kernels:
-+            raise RuntimeError(
-+                "VERL_RESPONSE_ONLY_LM_HEAD_PROFILE requires the unfused Megatron path; set use_fused_kernels=False"
-+            )
          pad_to_length_bucket = (
              self.engine_config.pad_to_length_bucket
              if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
-@@ -1386,6 +1390,20 @@ class MegatronEngineWithLMHead(MegatronEngine):
-                 "loss_mask": loss_mask,
-                 "response_attention_mask": response_attention_mask,
-             }
-+            response_only_lm_head_profile = None
-+            if profile_response_only_lm_head:
-+                response_only_lm_head_profile = {
-+                    "role": "ref" if self.engine_config.forward_only else "actor",
-+                    "data_format": data_format,
-+                    "calculate_entropy": bool(calculate_entropy),
-+                    "entropy_from_logits_with_chunking": self.engine_config.entropy_from_logits_with_chunking,
-+                    "entropy_from_logits_chunk_size": self.engine_config.entropy_from_logits_chunk_size,
-+                    "calculate_sum_pi_squared": bool(calculate_sum_pi_squared),
-+                    "distillation_only": bool(distillation_only),
-+                    "tensor_parallel_size": self.engine_config.tensor_model_parallel_size,
-+                    "context_parallel_size": local_cp_size or self.engine_config.context_parallel_size,
-+                    "pipeline_parallel_size": self.engine_config.pipeline_model_parallel_size,
-+                }
+@@ -1339,11 +1339,32 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         if use_fused_kernels:
+             temperature_value = _resolve_fused_temperature(temperature)
  
-             mtp_loss_normalization_factor = None
-             if (
-@@ -1409,6 +1427,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
++        data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
++        response_only_lm_head_profile = None
++        if profile_response_only_lm_head:
++            response_only_lm_head_profile = {
++                "role": "ref" if self.engine_config.forward_only else "actor",
++                "data_format": data_format,
++                "response_only_enabled": self.engine_config.response_only_lm_head,
++                "calculate_entropy": bool(calculate_entropy),
++                "entropy_from_logits_with_chunking": self.engine_config.entropy_from_logits_with_chunking,
++                "entropy_from_logits_chunk_size": self.engine_config.entropy_from_logits_chunk_size,
++                "calculate_sum_pi_squared": bool(calculate_sum_pi_squared),
++                "distillation_only": bool(distillation_only),
++                "tensor_parallel_size": self.engine_config.tensor_model_parallel_size,
++                "context_parallel_size": local_cp_size or self.engine_config.context_parallel_size,
++                "pipeline_parallel_size": self.engine_config.pipeline_model_parallel_size,
++            }
++
+         if use_fused_kernels:
+             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
+ 
+             response_attention_mask = None
+-            if self.engine_config.response_only_lm_head and attention_mask is not None and not loss_mask.is_nested:
++            if (
++                (self.engine_config.response_only_lm_head or profile_response_only_lm_head)
++                and attention_mask is not None
++                and not loss_mask.is_nested
++            ):
+                 response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
+             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
+             output = fused_forward_fn(
+@@ -1358,8 +1379,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 local_cp_size=local_cp_size,
+                 router_padding_mask=router_padding_mask,
+                 pad_to_length_bucket=pad_to_length_bucket,
+-                loss_mask=loss_mask if self.engine_config.response_only_lm_head else None,
++                loss_mask=loss_mask
++                if self.engine_config.response_only_lm_head or profile_response_only_lm_head
++                else None,
+                 response_attention_mask=response_attention_mask,
++                response_only_lm_head_profile=response_only_lm_head_profile,
+             )
+         else:
+             if not isinstance(temperature, torch.Tensor):
+@@ -1371,7 +1395,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
+             from verl.models.mcore import get_mcore_engine_forward_fn
+ 
+             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
+-            data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
+ 
+             logits_processor = partial(
+                 self._lm_head_logits_processor,
+@@ -1416,6 +1439,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                  data_format=data_format,
                  mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
                  response_only_lm_head=self.engine_config.response_only_lm_head,
@@ -775,6 +1276,3 @@ index a2f0c129..caa91420 100644
                  local_cp_size=local_cp_size,
                  router_padding_mask=router_padding_mask,
                  mtp_loss_normalization_factor=mtp_loss_normalization_factor,
--- 
-2.51.0.windows.2
-
