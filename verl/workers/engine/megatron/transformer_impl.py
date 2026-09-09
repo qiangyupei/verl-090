@@ -1260,15 +1260,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
+        profile_response_only_lm_head = os.getenv("VERL_RESPONSE_ONLY_LM_HEAD_PROFILE") == "1"
 
         if self.engine_config.response_only_lm_head and distillation_use_topk:
             raise NotImplementedError("response_only_lm_head does not support top-k distillation")
-        if (
-            self.engine_config.response_only_lm_head
-            and self.model_config.mtp.enable
-            and self.model_config.mtp.enable_train
-        ):
+        mtp_training = self.model_config.mtp.enable and self.model_config.mtp.enable_train
+        if self.engine_config.response_only_lm_head and mtp_training:
             raise NotImplementedError("response_only_lm_head does not support MTP training")
+        if profile_response_only_lm_head and mtp_training:
+            raise NotImplementedError("response_only_lm_head profiling does not support MTP training")
         pad_to_length_bucket = (
             self.engine_config.pad_to_length_bucket
             if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
@@ -1339,11 +1339,32 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if use_fused_kernels:
             temperature_value = _resolve_fused_temperature(temperature)
 
+        data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
+        response_only_lm_head_profile = None
+        if profile_response_only_lm_head:
+            response_only_lm_head_profile = {
+                "role": "ref" if self.engine_config.forward_only else "actor",
+                "data_format": data_format,
+                "response_only_enabled": self.engine_config.response_only_lm_head,
+                "calculate_entropy": bool(calculate_entropy),
+                "entropy_from_logits_with_chunking": self.engine_config.entropy_from_logits_with_chunking,
+                "entropy_from_logits_chunk_size": self.engine_config.entropy_from_logits_chunk_size,
+                "calculate_sum_pi_squared": bool(calculate_sum_pi_squared),
+                "distillation_only": bool(distillation_only),
+                "tensor_parallel_size": self.engine_config.tensor_model_parallel_size,
+                "context_parallel_size": local_cp_size or self.engine_config.context_parallel_size,
+                "pipeline_parallel_size": self.engine_config.pipeline_model_parallel_size,
+            }
+
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
             response_attention_mask = None
-            if self.engine_config.response_only_lm_head and attention_mask is not None and not loss_mask.is_nested:
+            if (
+                (self.engine_config.response_only_lm_head or profile_response_only_lm_head)
+                and attention_mask is not None
+                and not loss_mask.is_nested
+            ):
                 response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
             output = fused_forward_fn(
@@ -1358,8 +1379,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 local_cp_size=local_cp_size,
                 router_padding_mask=router_padding_mask,
                 pad_to_length_bucket=pad_to_length_bucket,
-                loss_mask=loss_mask if self.engine_config.response_only_lm_head else None,
+                loss_mask=loss_mask
+                if self.engine_config.response_only_lm_head or profile_response_only_lm_head
+                else None,
                 response_attention_mask=response_attention_mask,
+                response_only_lm_head_profile=response_only_lm_head_profile,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
@@ -1371,7 +1395,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
             from verl.models.mcore import get_mcore_engine_forward_fn
 
             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
-            data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
 
             logits_processor = partial(
                 self._lm_head_logits_processor,
@@ -1416,6 +1439,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 data_format=data_format,
                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
                 response_only_lm_head=self.engine_config.response_only_lm_head,
+                response_only_lm_head_profile=response_only_lm_head_profile,
                 local_cp_size=local_cp_size,
                 router_padding_mask=router_padding_mask,
                 mtp_loss_normalization_factor=mtp_loss_normalization_factor,

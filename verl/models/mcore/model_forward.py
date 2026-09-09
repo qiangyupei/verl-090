@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager
 
 import torch
 from torch.nested._internal.nested_tensor import NestedTensor
@@ -262,6 +262,31 @@ def _build_full_loss_mask_nested(response_mask, input_ids_lengths, response_atte
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
 
 
+@contextmanager
+def _response_only_lm_head_context(model, projection_mask, enabled, profile_metadata):
+    """Install response-only projection and optional profiling for one forward."""
+    if projection_mask is None:
+        yield None
+        return
+
+    with ExitStack() as stack:
+        profiler = None
+        if profile_metadata is not None:
+            from .response_only_lm_head_profile import ResponseOnlyLMHeadProfiler
+
+            profiler = stack.enter_context(
+                ResponseOnlyLMHeadProfiler(
+                    model,
+                    projection_mask,
+                    response_only_enabled=enabled,
+                    metadata=profile_metadata,
+                )
+            )
+        if enabled:
+            stack.enter_context(response_only_output_projection(model, projection_mask))
+        yield profiler
+
+
 def gptmodel_forward_model_engine(
     model,
     input_ids,
@@ -274,6 +299,7 @@ def gptmodel_forward_model_engine(
     data_format: str = "thd",
     mtp_enable_train: bool = False,
     response_only_lm_head: bool = False,
+    response_only_lm_head_profile: dict | None = None,
     local_cp_size: int | None = None,
     forced_max_seqlen: int | None = None,
     pad_to_length_bucket: int | None = None,
@@ -314,7 +340,11 @@ def gptmodel_forward_model_engine(
         input_ids_rmpad = input_ids_rmpad.contiguous()
 
         projection_mask = None
-        if response_only_lm_head and post_process and logits_processor is not None:
+        if (
+            (response_only_lm_head or response_only_lm_head_profile is not None)
+            and post_process
+            and logits_processor is not None
+        ):
             input_ids_lengths = input_ids.offsets().diff().tolist()
             full_loss_mask = _build_full_loss_mask_nested(
                 logits_processor_args["loss_mask"],
@@ -371,10 +401,9 @@ def gptmodel_forward_model_engine(
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
 
-        projection_context = (
-            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
-        )
-        with projection_context:
+        with _response_only_lm_head_context(
+            model, projection_mask, response_only_lm_head, response_only_lm_head_profile
+        ) as lm_head_profiler:
             output_orig = model(
                 input_ids=input_ids_rmpad,
                 attention_mask=attention_mask,
@@ -396,9 +425,11 @@ def gptmodel_forward_model_engine(
                 )[0]
                 for k, v in logits_processor_args.items()
             }
-            if projection_mask is not None:
+            if response_only_lm_head and projection_mask is not None:
                 args["projection_mask"] = projection_mask
             output_dict = logits_processor(output_orig, **args)
+            if lm_head_profiler is not None:
+                lm_head_profiler.finish()
             output = {
                 k: postprocess_thd_engine(
                     v,
@@ -439,7 +470,11 @@ def gptmodel_forward_model_engine(
         )
 
         projection_mask = None
-        if response_only_lm_head and post_process and logits_processor is not None:
+        if (
+            (response_only_lm_head or response_only_lm_head_profile is not None)
+            and post_process
+            and logits_processor is not None
+        ):
             input_ids_lengths = input_ids.offsets().diff().tolist()
             full_loss_mask = _build_full_loss_mask_nested(
                 logits_processor_args["loss_mask"],
@@ -491,10 +526,9 @@ def gptmodel_forward_model_engine(
         else:
             attention_mask = attention_mask_bshd
 
-        projection_context = (
-            response_only_output_projection(model, projection_mask) if projection_mask is not None else nullcontext()
-        )
-        with projection_context:
+        with _response_only_lm_head_context(
+            model, projection_mask, response_only_lm_head, response_only_lm_head_profile
+        ) as lm_head_profiler:
             output_orig = model(
                 input_ids=input_ids_bshd,
                 attention_mask=attention_mask,
@@ -512,9 +546,11 @@ def gptmodel_forward_model_engine(
                 )[0]
                 for k, v in logits_processor_args.items()
             }
-            if projection_mask is not None:
+            if response_only_lm_head and projection_mask is not None:
                 args["projection_mask"] = projection_mask
             output_dict = logits_processor(output_orig, **args)
+            if lm_head_profiler is not None:
+                lm_head_profiler.finish()
             output = {
                 k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
                 for k, v in output_dict.items()

@@ -83,10 +83,15 @@ class FusedOutputProcessorContext:
 
     temperature: float
     projection_mask: Tensor | None = None
+    profiler: object | None = None
 
 
-def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_parallel, projection_mask=None):
+def _compute_fused_lm_head(
+    hidden_states, weight, labels, temperature, sequence_parallel, projection_mask=None, profiler=None
+):
     """Run the fused head on all rows or only the loss-bearing predictor rows."""
+    if profiler is not None:
+        profiler.start()
     tp_group = parallel_state.get_tensor_model_parallel_group()
     if sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
@@ -103,6 +108,8 @@ def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_
             labels = labels.new_zeros(1)
 
     log_probs, entropy = linear_cross_entropy(hidden_states, weight, labels, temperature, "none", tp_group)
+    if profiler is not None:
+        profiler.record_fused_projection(hidden_states, weight)
     if projection_mask is not None:
         outputs = restore_response_only_outputs(
             {"log_probs": log_probs.reshape(1, -1), "entropy": entropy.reshape(1, -1)},
@@ -110,6 +117,8 @@ def _compute_fused_lm_head(hidden_states, weight, labels, temperature, sequence_
             num_selected,
         )
         log_probs, entropy = outputs["log_probs"], outputs["entropy"]
+    if profiler is not None:
+        profiler.finish()
     return log_probs, entropy
 
 
@@ -144,6 +153,7 @@ def fused_output_processor(
         temperature,
         config.sequence_parallel,
         context.projection_mask,
+        context.profiler,
     )
 
     if has_config_logger_enabled(config):
@@ -301,6 +311,7 @@ def fused_forward_model_engine(vision_model: bool = False):
         pad_to_length_bucket: int | None = None,
         loss_mask: Tensor | None = None,
         response_attention_mask: Tensor | None = None,
+        response_only_lm_head_profile: dict | None = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -370,6 +381,18 @@ def fused_forward_model_engine(vision_model: bool = False):
                 cp_layout=cp_layout,
                 local_cp_size=local_cp_size,
             )[0].to(torch.bool)
+        profiler = None
+        if response_only_lm_head_profile is not None and post_process:
+            from .response_only_lm_head_profile import ResponseOnlyLMHeadProfiler
+
+            profiler = ResponseOnlyLMHeadProfiler(
+                None,
+                projection_mask,
+                response_only_enabled=response_only_lm_head_profile["response_only_enabled"],
+                metadata=response_only_lm_head_profile,
+            )
+            if not profiler.response_only_enabled:
+                projection_mask = None
         forward_kwargs = dict(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
@@ -382,11 +405,11 @@ def fused_forward_model_engine(vision_model: bool = False):
             output_orig: CausalLMOutputForPPO = model(
                 **forward_kwargs,
                 output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature, projection_mask),
+                output_processor_context=FusedOutputProcessorContext(temperature, projection_mask, profiler),
             )
         else:
             output_orig: CausalLMOutputForPPO = model(
-                temperature=temperature, projection_mask=projection_mask, **forward_kwargs
+                temperature=temperature, projection_mask=projection_mask, lm_head_profiler=profiler, **forward_kwargs
             )
 
         if not post_process:
@@ -444,6 +467,7 @@ def _fused_GPTModel_forward(
     temperature: float = 1.0,
     padding_mask: Tensor | None = None,
     projection_mask: Tensor | None = None,
+    lm_head_profiler=None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -519,6 +543,7 @@ def _fused_GPTModel_forward(
         temperature,
         model.config.sequence_parallel,
         projection_mask,
+        lm_head_profiler,
     )
 
     if has_config_logger_enabled(model.config):
