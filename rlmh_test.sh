@@ -38,7 +38,6 @@ COMMON=(
   actor_rollout_ref.ref.megatron.context_parallel_size=2
   "actor_rollout_ref.actor.megatron.param_offload=${ALL_OFFLOAD:-true}"
   "actor_rollout_ref.actor.megatron.optimizer_offload=${ALL_OFFLOAD:-true}"
-  "actor_rollout_ref.actor.megatron.grad_offload=${ALL_OFFLOAD:-true}"
   "actor_rollout_ref.ref.megatron.param_offload=${ALL_OFFLOAD:-true}"
   actor_rollout_ref.actor.ppo_mini_batch_size=1
   actor_rollout_ref.actor.data_loader_seed=42
