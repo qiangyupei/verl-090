@@ -1,0 +1,15 @@
+
+baseline
+backend	role	data_format	calculate_entropy	entropy_from_logits_with_chunking	entropy_from_logits_chunk_size	calculate_sum_pi_squared	distillation_only	tensor_parallel_size	context_parallel_size	pipeline_parallel_size	logits_dtype	vocab_shard	n	ranks	active_pct	latency_p50_ms	latency_p95_ms	dense_logits_GiB	actual_logits_GiB	logits_saved_GiB	peak_increment_GiB	peak_allocated_GiB
+fused	actor	thd	True	False	2048	False	False	2	2	2	none	75968	378	3	0.00	307.854	316.149	0.000	0.000	0.000	0.087	16.319
+fused	ref	thd	False	False	2048	False	False	2	2	2	none	75968	186	3	0.00	307.805	316.435	0.000	0.000	0.000	0.087	4.085
+
+response-only
+backend	role	data_format	calculate_entropy	entropy_from_logits_with_chunking	entropy_from_logits_chunk_size	calculate_sum_pi_squared	distillation_only	tensor_parallel_size	context_parallel_size	pipeline_parallel_size	logits_dtype	vocab_shard	n	ranks	active_pct	latency_p50_ms	latency_p95_ms	dense_logits_GiB	actual_logits_GiB	logits_saved_GiB	peak_increment_GiB	peak_allocated_GiB
+fused	actor	thd	True	False	2048	False	False	2	2	2	none	75968	378	3	0.00	5.656	131.140	0.000	0.000	0.000	0.078	16.323
+fused	ref	thd	False	False	2048	False	False	2	2	2	none	75968	186	3	0.00	5.608	131.431	0.000	0.000	0.000	0.078	4.074
+
+baseline -> response-only
+backend	role	data_format	calculate_entropy	entropy_from_logits_with_chunking	entropy_from_logits_chunk_size	calculate_sum_pi_squared	distillation_only	tensor_parallel_size	context_parallel_size	pipeline_parallel_size	logits_dtype	vocab_shard	forward_latency_reduction_pct	logits_saved_GiB	peak_increment_saved_GiB
+fused	actor	thd	True	False	2048	False	False	2	2	2	none	75968	98.16	0.000	0.009
+fused	ref	thd	False	False	2048	False	False	2	2	2	none	75968	98.18	0.000	0.009
